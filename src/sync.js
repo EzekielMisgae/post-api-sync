@@ -1,0 +1,99 @@
+const fs = require('fs-extra');
+const fg = require('fast-glob');
+const path = require('path');
+const { loadConfig, ensureAbsolute, normalizeIncludePatterns, normalizeExcludePatterns, ALWAYS_EXCLUDE } = require('./config');
+const { extractAllEndpoints } = require('./extract');
+const { mergePostmanCollection } = require('./merge/postman');
+const { mergeInsomniaCollection } = require('./merge/insomnia');
+const postmanCloud = require('./sync/postman-cloud');
+const { info, warn, success, error } = require('./log');
+const { isJsOrTs } = require('./utils');
+
+async function syncOnce({ configPath, baseDir, postmanKey, postmanId } = {}) {
+  try {
+    const { config, baseDir: resolvedBase } = await loadConfig(configPath, baseDir);
+    const cwd = resolvedBase || process.cwd();
+    // Use CLI args or config values
+    const pmKey = postmanKey || (config.output && config.output.postman && config.output.postman.apiKey);
+    const pmId = postmanId || (config.output && config.output.postman && config.output.postman.collectionId);
+
+    const include = normalizeIncludePatterns(config.sources.include || [], cwd);
+    const exclude = Array.from(new Set([
+      ...normalizeExcludePatterns(config.sources.exclude || [], cwd),
+      ...ALWAYS_EXCLUDE
+    ]));
+
+    const files = await fg(include, { ignore: exclude, dot: false, cwd, absolute: true });
+    const jsTsFiles = files.filter(isJsOrTs);
+
+    info(`Scanning ${jsTsFiles.length} file(s)...`);
+    if (jsTsFiles.length === 0) {
+      warn(`No files matched. cwd=${cwd}`);
+      warn(`include=${include.join(', ')}`);
+      warn(`exclude=${exclude.join(', ')}`);
+    }
+
+    let extracted = [];
+    try {
+      extracted = await extractAllEndpoints(jsTsFiles, config.framework);
+      if (extracted.length === 0 && config.framework && config.framework !== 'auto') {
+        const fallback = await extractAllEndpoints(jsTsFiles, 'auto');
+        if (fallback.length) {
+          warn(`No endpoints found for framework=${config.framework}. Falling back to auto-detect.`);
+          extracted = fallback;
+        }
+      }
+    } catch (err) {
+      warn(`Extraction failed: ${err.message || err}`);
+    }
+
+    const unique = new Map();
+    for (const e of extracted) unique.set(e.key, e);
+
+    const finalEndpoints = Array.from(unique.values());
+    info(`Found ${finalEndpoints.length} endpoint(s)`);
+
+    if (config.output && config.output.postman && config.output.postman.enabled) {
+      const outPath = ensureAbsolute(config.output.postman.outputPath, cwd);
+      const existing = await readJsonIfExists(outPath);
+      const merged = mergePostmanCollection(finalEndpoints, config, existing);
+      await fs.outputJson(outPath, merged, { spaces: 2 });
+      success(`Postman collection written to ${path.relative(process.cwd(), outPath)}`);
+
+      if (pmKey && pmId) {
+        info(`Pushing to Postman Cloud (ID: ${pmId})...`);
+        try {
+          await postmanCloud.pushToPostman(merged, pmKey, pmId);
+          success('Successfully synced to Postman Cloud!');
+        } catch (err) {
+          error(`Failed to sync to Postman Cloud: ${err.message}`);
+        }
+      }
+    }
+
+    if (config.output && config.output.insomnia && config.output.insomnia.enabled) {
+      const outPath = ensureAbsolute(config.output.insomnia.outputPath, cwd);
+      const existing = await readJsonIfExists(outPath);
+      const merged = mergeInsomniaCollection(finalEndpoints, config, existing);
+      await fs.outputJson(outPath, merged, { spaces: 2 });
+      success(`Insomnia collection written to ${path.relative(process.cwd(), outPath)}`);
+    }
+  } catch (err) {
+    error(err.stack || err.message || String(err));
+    process.exitCode = 1;
+  }
+}
+
+async function readJsonIfExists(filePath) {
+  if (await fs.pathExists(filePath)) {
+    try {
+      return await fs.readJson(filePath);
+    } catch (err) {
+      warn(`Failed to read existing collection at ${filePath}: ${err.message || err}`);
+      return null;
+    }
+  }
+  return null;
+}
+
+module.exports = { syncOnce };
