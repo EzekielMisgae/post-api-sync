@@ -18,9 +18,9 @@ Sync your API code directly to Postman and Insomnia collections.
 ## Installation
 
 ```bash
-npm install -g post-api-sync
+npm install -g @ezekielmisgae/post-api-sync
 # or use via npx
-npx post-api-sync --help
+npx @ezekielmisgae/post-api-sync --help
 ```
 
 ## Quick Start
