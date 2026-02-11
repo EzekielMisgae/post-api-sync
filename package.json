@@ -1,7 +1,14 @@
 {
-  "name": "post-api-sync",
+  "name": "@EzekielMisgae/post-api-sync",
   "version": "0.1.3",
   "description": "Sync Postman and Insomnia collections from API code",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/EzekielMisgae/post-api-sync.git"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
   "type": "commonjs",
   "bin": {
     "post-api-sync": "bin/post-api-sync.js"
