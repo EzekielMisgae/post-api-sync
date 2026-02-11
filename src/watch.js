@@ -3,7 +3,7 @@ const { loadConfig, normalizeIncludePatterns, normalizeExcludePatterns, ALWAYS_E
 const { syncOnce } = require('./sync');
 const { info } = require('./log');
 
-async function watchMode({ configPath, baseDir } = {}) {
+async function watchMode({ configPath, baseDir, postmanKey, postmanId } = {}) {
   const { config, baseDir: resolvedBase } = await loadConfig(configPath, baseDir);
   const cwd = resolvedBase || process.cwd();
   const include = normalizeIncludePatterns(config.sources.include || [], cwd);
@@ -19,7 +19,7 @@ async function watchMode({ configPath, baseDir } = {}) {
   const trigger = () => {
     if (timer) clearTimeout(timer);
     timer = setTimeout(() => {
-      syncOnce({ configPath, baseDir: cwd });
+      syncOnce({ configPath, baseDir: cwd, postmanKey, postmanId });
     }, debounceMs);
   };
 

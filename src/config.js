@@ -28,7 +28,7 @@ const DEFAULT_CONFIG = {
     markDeprecated: true
   },
   organization: {
-    groupBy: 'tags'
+    groupBy: 'folder'
   }
 };
 
