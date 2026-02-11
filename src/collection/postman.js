@@ -21,34 +21,67 @@ function buildPostmanCollection(endpoints, config) {
       _postman_id: nanoid()
     },
     item: items,
-    variable: [{ key: 'baseUrl', value: baseUrl }]
+    variable: [
+      { key: 'baseUrl', value: baseUrl, type: 'string' },
+      { key: 'authToken', value: '', type: 'string' },
+      { key: 'userId', value: '', type: 'string' },
+      { key: 'orderId', value: '', type: 'string' },
+      { key: 'wholesaleCustomerId', value: '', type: 'string' }
+    ]
   };
 }
 
 function buildFolderItems(endpoints) {
   const root = { item: [], _folders: {} };
-  const cwd = process.cwd();
 
   for (const endpoint of endpoints) {
-    const relPath = endpoint.filePath ? path.relative(cwd, endpoint.filePath) : '';
-    const dir = path.dirname(relPath);
-    // Split dir into parts, ignoring '.' or empty
-    const parts = dir.split(path.sep).filter(p => p && p !== '.');
+    // Determine module name from file path
+    // e.g. /abs/path/to/src/modules/health/routes.ts -> Health
+    // e.g. /abs/path/to/src/modules/orders/routes/order.routes.ts -> Orders
+    let moduleName = 'General';
+    if (endpoint.filePath) {
+      const parts = endpoint.filePath.split(path.sep);
+      const filename = parts[parts.length - 1];
+      const parent = parts[parts.length - 2];
+      const grandparent = parts[parts.length - 3];
 
-    let current = root;
-    for (const part of parts) {
-      // Skip common source dirs if desired, but user asked for folder structure
-      if (!current._folders[part]) {
-        const folder = { name: part, item: [], _folders: {} };
-        current.item.push(folder);
-        current._folders[part] = folder;
+      if (filename === 'routes.ts' || filename.endsWith('.routes.ts')) {
+        if (parent === 'routes' && grandparent) {
+          moduleName = capitalize(grandparent);
+        } else {
+          moduleName = capitalize(parent);
+        }
+      } else {
+        // Fallback: try to find a meaningful parent
+        // If parent is 'routes', go up one
+        if (parent === 'routes' && grandparent) {
+          moduleName = capitalize(grandparent);
+        } else {
+          moduleName = capitalize(parent);
+        }
       }
-      current = current._folders[part];
     }
-    current.item.push(buildItem(endpoint));
+
+    if (!root._folders[moduleName]) {
+      const folder = {
+        name: moduleName,
+        description: `All endpoints from ${endpoint.filePath || 'this module'}`,
+        item: [],
+        _folders: {}
+      };
+      root.item.push(folder);
+      root._folders[moduleName] = folder;
+    }
+
+    root._folders[moduleName].item.push(buildItem(endpoint));
   }
 
   return cleanFolders(root.item);
+}
+
+function capitalize(str) {
+  if (!str) return str;
+  return str.charAt(0).toUpperCase() + str.slice(1);
 }
 
 function cleanFolders(items) {
@@ -84,16 +117,41 @@ function buildItem(endpoint) {
 
   const example = hasBody ? exampleFromSchema(bodySchema) : null;
 
+  // Build headers
+  const headers = [];
+  if (hasBody) {
+    headers.push({ key: 'Content-Type', value: 'application/json', type: 'text' });
+  }
+  // Add Authorization header for protected endpoints (heuristic: /admin, /me, /user paths)
+  if (path.includes('/admin') || path.includes('/me') || path.includes('/user') || endpoint.auth) {
+    headers.push({ key: 'Authorization', value: 'Bearer {{authToken}}', type: 'text' });
+  }
+
+  // Build query string
+  let rawUrl = `{{baseUrl}}${path}`;
+  const queryString = queryParams
+    .map(q => {
+      const value = q.example || (q.type === 'number' ? '20' : q.required ? '{{' + q.name + '}}' : '');
+      return `${q.key || q.name}=${value}`;
+    })
+    .filter(Boolean)
+    .join('&');
+  if (queryString) rawUrl += '?' + queryString;
+
   return {
     name: endpoint.description || `${endpoint.method} ${endpoint.path}`,
     request: {
       method: endpoint.method,
-      header: hasBody ? [{ key: 'Content-Type', value: 'application/json' }] : [],
+      header: headers,
       url: {
-        raw: `{{baseUrl}}${path}`,
+        raw: rawUrl,
         host: ['{{baseUrl}}'],
         path: splitPath(path),
-        query: queryParams.map((q) => ({ key: q.name, value: '', disabled: !q.required })),
+        query: queryParams.map((q) => ({
+          key: q.key || q.name,
+          value: q.example || '',
+          disabled: !q.required
+        })),
         variable: pathParams.map((p) => ({ key: p, value: '' }))
       },
       body: hasBody
@@ -102,7 +160,8 @@ function buildItem(endpoint) {
           raw: JSON.stringify(example || {}, null, 2),
           options: { raw: { language: 'json' } }
         }
-        : undefined
+        : undefined,
+      description: endpoint.description || ''
     },
     response: []
   };
