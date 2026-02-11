@@ -14,20 +14,21 @@ function buildPostmanCollection(endpoints, config) {
     items = buildTaggedItems(endpoints);
   }
 
+  // IMPORTANT: variable comes BEFORE item in the collection structure
   return {
     info: {
+      _postman_id: nanoid(),
       name,
-      schema: 'https://schema.getpostman.com/json/collection/v2.1.0/collection.json',
-      _postman_id: nanoid()
+      schema: 'https://schema.getpostman.com/json/collection/v2.1.0/collection.json'
     },
-    item: items,
     variable: [
       { key: 'baseUrl', value: baseUrl, type: 'string' },
       { key: 'authToken', value: '', type: 'string' },
       { key: 'userId', value: '', type: 'string' },
       { key: 'orderId', value: '', type: 'string' },
       { key: 'wholesaleCustomerId', value: '', type: 'string' }
-    ]
+    ],
+    item: items
   };
 }
 
@@ -122,48 +123,63 @@ function buildItem(endpoint) {
   if (hasBody) {
     headers.push({ key: 'Content-Type', value: 'application/json', type: 'text' });
   }
-  // Add Authorization header for protected endpoints (heuristic: /admin, /me, /user paths)
-  if (path.includes('/admin') || path.includes('/me') || path.includes('/user') || endpoint.auth) {
+  // Add Authorization header for protected endpoints (heuristic: /admin, /me, /user paths or auth/ping)
+  const needsAuth = path.includes('/admin') || path.includes('/me') || path.includes('/user') || path.includes('/ping') || endpoint.auth;
+  if (needsAuth) {
     headers.push({ key: 'Authorization', value: 'Bearer {{authToken}}', type: 'text' });
   }
 
-  // Build query string
+  // Build query string for raw URL
   let rawUrl = `{{baseUrl}}${path}`;
   const queryString = queryParams
+    .filter(q => !q.disabled)
     .map(q => {
-      const value = q.example || (q.type === 'number' ? '20' : q.required ? '{{' + q.name + '}}' : '');
+      const value = q.value || q.example || (q.type === 'number' ? '20' : q.required ? `{{${q.name}}}` : '');
       return `${q.key || q.name}=${value}`;
     })
     .filter(Boolean)
     .join('&');
   if (queryString) rawUrl += '?' + queryString;
 
+  const url = {
+    raw: rawUrl,
+    host: ['{{baseUrl}}'],
+    path: splitPath(path)
+  };
+
+  // Only include query/variable arrays if they have content
+  if (queryParams.length > 0) {
+    url.query = queryParams.map((q) => {
+      const item = {
+        key: q.key || q.name,
+        value: q.value || q.example || ''
+      };
+      if (q.disabled) item.disabled = true;
+      return item;
+    });
+  }
+
+  if (pathParams.length > 0) {
+    url.variable = pathParams.map((p) => ({ key: p, value: '' }));
+  }
+
+  const request = {
+    method: endpoint.method,
+    header: headers,
+    url,
+    description: endpoint.description || `${endpoint.method} ${endpoint.path}`
+  };
+
+  if (hasBody) {
+    request.body = {
+      mode: 'raw',
+      raw: JSON.stringify(example || {}, null, 2)
+    };
+  }
+
   return {
     name: endpoint.description || `${endpoint.method} ${endpoint.path}`,
-    request: {
-      method: endpoint.method,
-      header: headers,
-      url: {
-        raw: rawUrl,
-        host: ['{{baseUrl}}'],
-        path: splitPath(path),
-        query: queryParams.map((q) => ({
-          key: q.key || q.name,
-          value: q.example || '',
-          disabled: !q.required
-        })),
-        variable: pathParams.map((p) => ({ key: p, value: '' }))
-      },
-      body: hasBody
-        ? {
-          mode: 'raw',
-          raw: JSON.stringify(example || {}, null, 2),
-          options: { raw: { language: 'json' } }
-        }
-        : undefined,
-      description: endpoint.description || ''
-    },
-    response: []
+    request
   };
 }
 
