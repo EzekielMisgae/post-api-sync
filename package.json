@@ -1,6 +1,6 @@
 {
   "name": "post-api-sync",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Sync Postman and Insomnia collections from API code",
   "repository": {
     "type": "git",
