@@ -86,6 +86,7 @@ module.exports = {
 ```
 
 When `sources.appBaseUrls` is set, generated requests automatically use app-specific variables like `{{baseUrl_orders}}` based on endpoint file paths (for example `apps/orders/...`).
+For monorepos, folder organization is app-aware by default: requests are grouped as `App -> Module -> (Submodule)` based on file paths (for example `apps/business/src/review/review.controller.ts` -> `Business / Review`).
 If configured include globs match no files, sync now auto-discovers route/controller candidates across the repository (while ignoring build/dependency folders), so unusual project layouts still work without manual glob updates.
 
 ### Environment Variables
