@@ -30,7 +30,7 @@ npx post-api-sync --help
     npx post-api-sync init
     ```
     This will create an `post-api-sync.config.js` file in your project root.
-    The init flow auto-detects framework (NestJS/Express/Hono), applies recommended include globs, and supports an advanced mode if you want to customize globs manually.
+    The init flow auto-detects framework (NestJS/Express/Hono), applies recommended include globs, supports multi-app base URLs (e.g. ports 8000-8003), and has an advanced mode for manual glob customization.
 
 2.  **Run extraction**:
     ```bash
@@ -57,7 +57,14 @@ module.exports = {
     // Glob patterns to exclude
     exclude: ['**/*.test.ts'],
     // Base URL for variables in collections
-    baseUrl: 'http://localhost:3000/api'
+    baseUrl: 'http://localhost:3000/api',
+    // Optional: multi-app base URLs (microservices/monorepo)
+    // appBaseUrls: {
+    //   auth: 'http://localhost:8000/api',
+    //   orders: 'http://localhost:8001/api',
+    //   inventory: 'http://localhost:8002/api',
+    //   payments: 'http://localhost:8003/api'
+    // }
   },
 
   organization: {
@@ -77,6 +84,8 @@ module.exports = {
   }
 };
 ```
+
+When `sources.appBaseUrls` is set, generated requests automatically use app-specific variables like `{{baseUrl_orders}}` based on endpoint file paths (for example `apps/orders/...`).
 
 ### Environment Variables
 You can use a `.env` file in your project root to store sensitive keys:
