@@ -13,6 +13,7 @@ const HTTP_DECORATORS = {
   Options: 'OPTIONS',
   Head: 'HEAD'
 };
+const RPC_DECORATORS = new Set(['GrpcMethod', 'GrpcStreamMethod', 'MessagePattern', 'EventPattern']);
 
 const OPTIONAL_DECORATORS = new Set(['IsOptional', 'ApiPropertyOptional']);
 const TYPE_DECORATORS = new Map([
@@ -106,6 +107,64 @@ function getPropertyName(node) {
   return null;
 }
 
+function getMethodName(memberNode) {
+  if (!memberNode || !memberNode.key) return 'handler';
+  return getPropertyName(memberNode.key) || 'handler';
+}
+
+function getSimpleLiteral(node) {
+  if (!node) return null;
+  if (node.type === 'StringLiteral') return node.value;
+  if (node.type === 'NumericLiteral') return String(node.value);
+  if (node.type === 'BooleanLiteral') return String(node.value);
+  if (node.type === 'TemplateLiteral' && node.quasis.length === 1) {
+    return node.quasis[0].value.cooked || '';
+  }
+  return null;
+}
+
+function normalizeRpcSegment(value, fallback) {
+  const out = String(value || fallback || '').trim();
+  if (!out) return fallback;
+  return out.replace(/[^A-Za-z0-9_.-]+/g, '-');
+}
+
+function parseRpcMeta(dec, handlerName, controllerName) {
+  const name = getDecoratorName(dec);
+  if (!name || !RPC_DECORATORS.has(name)) return null;
+  const args = getDecoratorArgs(dec);
+
+  if (name === 'GrpcMethod' || name === 'GrpcStreamMethod') {
+    const service = normalizeRpcSegment(getSimpleLiteral(args[0]), controllerName || 'GrpcService');
+    const method = normalizeRpcSegment(getSimpleLiteral(args[1]), handlerName || 'Call');
+    return {
+      kind: name === 'GrpcStreamMethod' ? 'grpc-stream' : 'grpc',
+      path: normalizePath(`/grpc/${service}/${method}`),
+      summary: `${service}.${method}`,
+      description: name === 'GrpcStreamMethod'
+        ? `gRPC stream method ${service}.${method}`
+        : `gRPC method ${service}.${method}`
+    };
+  }
+
+  const pattern = normalizeRpcSegment(getSimpleLiteral(args[0]), handlerName || 'message');
+  if (name === 'MessagePattern') {
+    return {
+      kind: 'message-pattern',
+      path: normalizePath(`/rpc/message/${pattern}`),
+      summary: `Message Pattern ${pattern}`,
+      description: `NestJS MessagePattern handler for "${pattern}"`
+    };
+  }
+
+  return {
+    kind: 'event-pattern',
+    path: normalizePath(`/rpc/event/${pattern}`),
+    summary: `Event Pattern ${pattern}`,
+    description: `NestJS EventPattern handler for "${pattern}"`
+  };
+}
+
 function getDecoratorObjectArg(dec) {
   const args = getDecoratorArgs(dec);
   const first = args[0];
@@ -153,6 +212,18 @@ function getPropMetaFromDecorators(decorators) {
 function collectDtoSchemasFromAst(ast) {
   const dtoMap = new Map();
 
+  function mapTypeElements(typeElements = []) {
+    const props = [];
+    for (const member of typeElements) {
+      if (member.type !== 'TSPropertySignature') continue;
+      const name = getPropertyName(member.key);
+      if (!name) continue;
+      const typeNode = member.typeAnnotation ? member.typeAnnotation.typeAnnotation : null;
+      props.push({ name, optional: member.optional === true, typeNode });
+    }
+    return props;
+  }
+
   traverse(ast, {
     ClassDeclaration(path) {
       const classNode = path.node;
@@ -171,6 +242,23 @@ function collectDtoSchemasFromAst(ast) {
       }
 
       if (props.length) dtoMap.set(className, { name: className, props });
+    },
+
+    TSInterfaceDeclaration(path) {
+      const node = path.node;
+      if (!node.id || !node.id.name) return;
+      const interfaceName = node.id.name;
+      const props = mapTypeElements(node.body && node.body.body ? node.body.body : []);
+      if (props.length) dtoMap.set(interfaceName, { name: interfaceName, props });
+    },
+
+    TSTypeAliasDeclaration(path) {
+      const node = path.node;
+      if (!node.id || !node.id.name) return;
+      if (!node.typeAnnotation || node.typeAnnotation.type !== 'TSTypeLiteral') return;
+      const aliasName = node.id.name;
+      const props = mapTypeElements(node.typeAnnotation.members || []);
+      if (props.length) dtoMap.set(aliasName, { name: aliasName, props });
     }
   });
 
@@ -303,8 +391,12 @@ function buildSchemaForDto(dtoName, dtoMap, depth = 0, memo = new Map()) {
   return schema;
 }
 
+function getParamDecoratorTarget(paramNode) {
+  return paramNode && (paramNode.decorators ? paramNode : paramNode.left || paramNode);
+}
+
 function getParamDecorators(paramNode, dtoSchemas) {
-  const decoratorTarget = paramNode.decorators ? paramNode : paramNode.left || paramNode;
+  const decoratorTarget = getParamDecoratorTarget(paramNode);
   const decorators = decoratorTarget.decorators || [];
   const params = [];
   const query = [];
@@ -354,6 +446,22 @@ function getParamDecorators(paramNode, dtoSchemas) {
   return { params, query, body };
 }
 
+function getRpcBodySchema(paramList, dtoSchemas) {
+  const skipDecorators = new Set(['Ctx', 'Context', 'Metadata', 'Headers']);
+  for (const paramNode of paramList || []) {
+    const target = getParamDecoratorTarget(paramNode);
+    if (!target) continue;
+    const decorators = target.decorators || [];
+    const shouldSkip = decorators.some((dec) => skipDecorators.has(getDecoratorName(dec)));
+    if (shouldSkip) continue;
+
+    const typeNode = target.typeAnnotation ? target.typeAnnotation.typeAnnotation : null;
+    if (!typeNode) continue;
+    return schemaFromTypeNode(typeNode, dtoSchemas);
+  }
+  return null;
+}
+
 async function extractNestJsEndpoints(filePath) {
   const ast = await parseFile(filePath);
   const endpoints = [];
@@ -363,6 +471,7 @@ async function extractNestJsEndpoints(filePath) {
     ClassDeclaration(path) {
       const classNode = path.node;
       const decorators = classNode.decorators || [];
+      const className = classNode.id && classNode.id.name ? classNode.id.name : 'GrpcService';
       let basePath = '';
       let tags = [];
       let classAuth = false;
@@ -388,8 +497,10 @@ async function extractNestJsEndpoints(filePath) {
         if (!isMethod && !isPropertyWithFn) continue;
 
         const methodDecorators = memberNode.decorators || [];
+        const handlerName = getMethodName(memberNode);
         let httpMethod = null;
         let methodPath = '';
+        let rpcMeta = null;
         let summary = null;
         let description = null;
         let methodAuth = false;
@@ -402,6 +513,8 @@ async function extractNestJsEndpoints(filePath) {
             httpMethod = HTTP_DECORATORS[name];
             methodPath = getStringArg(dec);
           }
+          const maybeRpc = parseRpcMeta(dec, handlerName, className);
+          if (maybeRpc) rpcMeta = maybeRpc;
           if (name === 'ApiOperation') {
             const apiOp = getApiOperationMeta(dec);
             summary = apiOp.summary || summary;
@@ -410,9 +523,11 @@ async function extractNestJsEndpoints(filePath) {
           if (hasAuthDecorator(dec)) methodAuth = true;
         }
 
-        if (!httpMethod) continue;
+        if (!httpMethod && !rpcMeta) continue;
 
-        const fullPath = normalizePath(joinPaths(basePath, methodPath));
+        const fullPath = httpMethod
+          ? normalizePath(joinPaths(basePath, methodPath))
+          : rpcMeta.path;
         const params = [];
         const query = [];
         let bodySchema = null;
@@ -424,22 +539,31 @@ async function extractNestJsEndpoints(filePath) {
           query.push(...res.query);
           if (res.body) bodySchema = res.body;
         }
+        if (!bodySchema && rpcMeta) {
+          bodySchema = getRpcBodySchema(paramList, dtoSchemas);
+        }
+
+        const method = httpMethod || 'POST';
+        const endpointSummary = summary || (rpcMeta ? rpcMeta.summary : undefined);
+        const endpointDescription = description || (rpcMeta ? rpcMeta.description : `${method} ${fullPath}`);
 
         const endpoint = {
-          method: httpMethod,
+          method,
           path: fullPath,
-          summary: summary || undefined,
-          description: description || `${httpMethod} ${fullPath}`,
+          summary: endpointSummary || undefined,
+          description: endpointDescription,
           tags: tags.length ? tags : undefined,
           decorators: decoratorNames,
+          protocol: rpcMeta ? (rpcMeta.kind.startsWith('grpc') ? 'grpc' : 'rpc') : undefined,
+          rpcKind: rpcMeta ? rpcMeta.kind : undefined,
           auth: classAuth || methodAuth || undefined,
           parameters: {
-            path: params.length ? params : undefined,
-            query: query.length ? query : undefined,
+            path: httpMethod && params.length ? params : undefined,
+            query: httpMethod && query.length ? query : undefined,
             body: bodySchema || undefined
           },
           filePath,
-          key: toKey(httpMethod, fullPath)
+          key: toKey(method, fullPath)
         };
         endpoints.push(endpoint);
       }
