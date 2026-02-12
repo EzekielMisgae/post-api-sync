@@ -125,7 +125,7 @@ function keyFromPostmanItem(item) {
   if (url.raw) raw = url.raw;
   let path = '';
   if (raw) {
-    path = raw.replace(/\{\{\s*baseUrl\s*\}\}/i, '');
+    path = raw.replace(/\{\{\s*baseUrl\s*\}\}/i, '').split('?')[0].split('#')[0];
   } else if (Array.isArray(url.path)) {
     path = `/${url.path.join('/')}`;
   }
@@ -141,14 +141,24 @@ function mergePostmanItem(newItem, existingItem) {
   const existingRequest = existingItem.request || {};
 
   const headers = mergeHeaders(newRequest.header || [], existingRequest.header || []);
+  const method = newRequest.method || existingRequest.method;
+  const shouldDropBody = ['GET', 'DELETE', 'HEAD', 'OPTIONS'].includes(String(method || '').toUpperCase());
 
   merged.request = {
     ...existingRequest,
-    method: newRequest.method || existingRequest.method,
+    method,
     url: newRequest.url || existingRequest.url,
     header: headers,
-    body: newRequest.body || existingRequest.body
+    description: newRequest.description !== undefined ? newRequest.description : existingRequest.description
   };
+
+  if (newRequest.body !== undefined) {
+    merged.request.body = newRequest.body;
+  } else if (shouldDropBody) {
+    delete merged.request.body;
+  } else if (existingRequest.body !== undefined) {
+    merged.request.body = existingRequest.body;
+  }
 
   if (newItem.description && !existingItem.description) {
     merged.description = newItem.description;
