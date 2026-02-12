@@ -56,38 +56,118 @@ function resolveImportFile(baseDir, source) {
   return null;
 }
 
-function parseCreateRoute(node) {
+function parseCreateRoute(node, schemaDefs) {
   if (!node || node.type !== 'CallExpression') return null;
   if (node.callee.type !== 'Identifier' || node.callee.name !== 'createRoute') return null;
   const arg = node.arguments && node.arguments[0];
   if (!arg || arg.type !== 'ObjectExpression') return null;
+
   let method = null;
   let routePath = null;
   let summary = null;
+  let description = null;
+  let tags = [];
+  let middleware = [];
+  let request = null;
+
   for (const prop of arg.properties) {
     if (prop.type !== 'ObjectProperty') continue;
     if (prop.key.type !== 'Identifier') continue;
-    if (prop.key.name === 'method' && prop.value.type === 'StringLiteral') {
-      method = prop.value.value;
+
+    const key = prop.key.name;
+    const value = prop.value;
+
+    if (key === 'method' && value.type === 'StringLiteral') {
+      method = value.value;
     }
-    if (prop.key.name === 'path' && prop.value.type === 'StringLiteral') {
-      routePath = prop.value.value;
+    if (key === 'path' && value.type === 'StringLiteral') {
+      routePath = value.value;
     }
-    if (prop.key.name === 'summary' && prop.value.type === 'StringLiteral') {
-      summary = prop.value.value;
+    if (key === 'summary' && value.type === 'StringLiteral') {
+      summary = value.value;
+    }
+    if (key === 'description' && value.type === 'StringLiteral') {
+      description = value.value;
+    }
+    if (key === 'tags' && value.type === 'ArrayExpression') {
+      for (const el of value.elements || []) {
+        if (el && el.type === 'StringLiteral') tags.push(el.value);
+      }
+    }
+    if (key === 'middleware' && value.type === 'ArrayExpression') {
+      for (const el of value.elements || []) {
+        if (el && el.type === 'Identifier') middleware.push(el.name);
+        if (el && el.type === 'CallExpression' && el.callee.type === 'Identifier') {
+          middleware.push(el.callee.name);
+        }
+      }
+    }
+    if (key === 'request' && value.type === 'ObjectExpression') {
+      request = parseRequestSchema(value, schemaDefs);
     }
   }
+
   if (!method || !routePath) return null;
-  return { method: method.toUpperCase(), path: routePath, description: summary };
+  return {
+    method: method.toUpperCase(),
+    path: routePath,
+    summary,
+    description: description || summary,
+    tags,
+    middleware,
+    request
+  };
 }
 
-function parseOpenApiRouteArg(node, routeDefs) {
+function parseRequestSchema(node, schemaDefs) {
+  const schema = { query: null, params: null, body: null };
+
+  for (const prop of node.properties || []) {
+    if (prop.type !== 'ObjectProperty' || prop.key.type !== 'Identifier') continue;
+    const key = prop.key.name;
+
+    if (key === 'query') {
+      schema.query = resolveZodSchema(prop.value, schemaDefs);
+    }
+    if (key === 'params') {
+      schema.params = resolveZodSchema(prop.value, schemaDefs);
+    }
+    if (key === 'body') {
+      const bodyDef = prop.value;
+      if (bodyDef.type === 'ObjectExpression') {
+        for (const bodyProp of bodyDef.properties || []) {
+          if (bodyProp.key && bodyProp.key.name === 'content') {
+            const content = bodyProp.value;
+            if (content.type === 'ObjectExpression') {
+              for (const contentProp of content.properties || []) {
+                if (contentProp.key && contentProp.key.name === 'application/json') {
+                  const jsonDef = contentProp.value;
+                  if (jsonDef.type === 'ObjectExpression') {
+                    for (const jsonProp of jsonDef.properties || []) {
+                      if (jsonProp.key && jsonProp.key.name === 'schema') {
+                        schema.body = resolveZodSchema(jsonProp.value, schemaDefs);
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return schema;
+}
+
+function parseOpenApiRouteArg(node, routeDefs, schemaDefs) {
   if (!node) return null;
   if (node.type === 'Identifier' && routeDefs.has(node.name)) {
     return routeDefs.get(node.name);
   }
   if (node.type === 'CallExpression') {
-    const parsed = parseCreateRoute(node);
+    const parsed = parseCreateRoute(node, schemaDefs);
     if (parsed) return parsed;
   }
   if (node.type === 'ObjectExpression') {
@@ -160,6 +240,54 @@ function parseValidatorArgs(args, schemaDefs) {
   return { target, schema };
 }
 
+function extractParameters(requestSchema) {
+  const params = {};
+
+  if (requestSchema.query) {
+    const queryParams = [];
+    if (requestSchema.query.properties) {
+      for (const [key, val] of Object.entries(requestSchema.query.properties)) {
+        queryParams.push({
+          name: key,
+          key: key,
+          required: !val.optional,
+          type: val.type || 'string',
+          example: val.example || generateExampleValue(val)
+        });
+      }
+    }
+    params.query = queryParams;
+  }
+
+  if (requestSchema.params) {
+    const pathParams = [];
+    if (requestSchema.params.properties) {
+      for (const [key, val] of Object.entries(requestSchema.params.properties)) {
+        pathParams.push({
+          name: key,
+          required: true,
+          type: val.type || 'string'
+        });
+      }
+    }
+    params.params = pathParams;
+  }
+
+  if (requestSchema.body) {
+    params.body = requestSchema.body;
+  }
+
+  return params;
+}
+
+function generateExampleValue(schema) {
+  if (!schema) return '';
+  if (schema.example !== undefined) return schema.example;
+  if (schema.type === 'number' || schema.type === 'integer') return 20;
+  if (schema.type === 'boolean') return false;
+  return '';
+}
+
 async function parseHonoFile(filePath) {
   const ast = await parseFile(filePath);
   const routers = new Map();
@@ -222,7 +350,7 @@ async function parseHonoFile(filePath) {
         schemaDefs.set(varName, init);
       }
 
-      const createRouteParsed = parseCreateRoute(init);
+      const createRouteParsed = parseCreateRoute(init, schemaDefs);
       if (createRouteParsed) {
         routeDefs.set(varName, createRouteParsed);
         return;
@@ -282,13 +410,17 @@ async function parseHonoFile(filePath) {
               }
             }
             if (call.name === 'openapi') {
-              const route = parseOpenApiRouteArg(call.args[0], routeDefs);
+              const route = parseOpenApiRouteArg(call.args[0], routeDefs, schemaDefs);
               if (route) {
                 endpoints.push({
                   routerVar: varName,
                   method: route.method,
                   path: route.path,
-                  description: route.description || `${route.method} ${route.path}`
+                  summary: route.summary,
+                  description: route.description || route.summary || `${route.method} ${route.path}`,
+                  tags: route.tags || [],
+                  middleware: route.middleware || [],
+                  parameters: route.request ? extractParameters(route.request) : {}
                 });
               }
             }
@@ -371,13 +503,17 @@ async function parseHonoFile(filePath) {
 
         if (methodName === 'openapi') {
           if (!routers.has(routerVar)) routers.set(routerVar, { basePath: '' });
-          const route = parseOpenApiRouteArg(node.arguments[0], routeDefs);
+          const route = parseOpenApiRouteArg(node.arguments[0], routeDefs, schemaDefs);
           if (route) {
             endpoints.push({
               routerVar,
               method: route.method,
               path: route.path,
-              description: route.description || `${route.method} ${route.path}`
+              summary: route.summary,
+              description: route.description || route.summary || `${route.method} ${route.path}`,
+              tags: route.tags || [],
+              middleware: route.middleware || [],
+              parameters: route.request ? extractParameters(route.request) : {}
             });
           }
         }
@@ -507,7 +643,10 @@ async function extractHonoEndpoints(files) {
         results.push({
           method: endpoint.method,
           path: fullPath,
+          summary: endpoint.summary,
           description: endpoint.description || `${endpoint.method} ${fullPath}`,
+          tags: endpoint.tags || [],
+          middleware: endpoint.middleware || [],
           parameters: endpoint.parameters || {},
           filePath: router ? router.filePath : undefined,
           key: toKey(endpoint.method, fullPath)

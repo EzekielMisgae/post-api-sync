@@ -123,8 +123,16 @@ function buildItem(endpoint) {
   if (hasBody) {
     headers.push({ key: 'Content-Type', value: 'application/json', type: 'text' });
   }
-  // Add Authorization header for protected endpoints (heuristic: /admin, /me, /user paths or auth/ping)
-  const needsAuth = path.includes('/admin') || path.includes('/me') || path.includes('/user') || path.includes('/ping') || endpoint.auth;
+
+  // Detect auth requirement from middleware or path patterns
+  const authMiddleware = endpoint.middleware && endpoint.middleware.some(m =>
+    m.includes('require') || m.includes('auth') || m.includes('Auth') || m.includes('protect')
+  );
+  const authPath = path.includes('/admin') || path.includes('/me') || path.includes('/user') ||
+    path.includes('/ping') || path.includes('/export') || path.includes('/wholesale') ||
+    path.includes('/my') || path.includes('/all');
+  const needsAuth = authMiddleware || authPath || endpoint.auth;
+
   if (needsAuth) {
     headers.push({ key: 'Authorization', value: 'Bearer {{authToken}}', type: 'text' });
   }
@@ -177,8 +185,13 @@ function buildItem(endpoint) {
     };
   }
 
+  // Use format: "{summary} - {method} {path}"
+  const requestName = endpoint.summary
+    ? `${endpoint.summary} - ${endpoint.method} ${endpoint.path}`
+    : endpoint.description || `${endpoint.method} ${endpoint.path}`;
+
   return {
-    name: endpoint.description || `${endpoint.method} ${endpoint.path}`,
+    name: requestName,
     request
   };
 }
