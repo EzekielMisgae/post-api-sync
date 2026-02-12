@@ -117,6 +117,7 @@ Or set them in your config/environment variables to use with `watch` mode.
 - DTOs in `@Body()` and `@Query()`.
 - `class-validator` decorators: `@IsString`, `@IsInt`, `@Min`, etc.
 - `@ApiProperty({ example: ... })` for example values.
+- gRPC/microservice handlers: `@GrpcMethod`, `@GrpcStreamMethod`, `@MessagePattern`, `@EventPattern`.
 
 ## License
 
