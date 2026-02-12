@@ -1,7 +1,7 @@
 const fs = require('fs-extra');
 const fg = require('fast-glob');
 const path = require('path');
-const { loadConfig, ensureAbsolute, normalizeIncludePatterns, normalizeExcludePatterns, ALWAYS_EXCLUDE } = require('./config');
+const { loadConfig, ensureAbsolute, normalizeIncludePatterns, normalizeExcludePatterns, ALWAYS_EXCLUDE, DEFAULT_INCLUDE } = require('./config');
 const { extractAllEndpoints } = require('./extract');
 const { mergePostmanCollection } = require('./merge/postman');
 const { mergeInsomniaCollection } = require('./merge/insomnia');
@@ -23,8 +23,24 @@ async function syncOnce({ configPath, baseDir, postmanKey, postmanId } = {}) {
       ...ALWAYS_EXCLUDE
     ]));
 
-    const files = await fg(include, { ignore: exclude, dot: false, cwd, absolute: true });
-    const jsTsFiles = files.filter(isJsOrTs);
+    let files = await fg(include, { ignore: exclude, dot: false, cwd, absolute: true });
+    let jsTsFiles = files.filter(isJsOrTs);
+
+    if (jsTsFiles.length === 0) {
+      const fallbackInclude = normalizeIncludePatterns(DEFAULT_INCLUDE, cwd);
+      files = await fg(fallbackInclude, { ignore: exclude, dot: false, cwd, absolute: true });
+      jsTsFiles = files.filter(isJsOrTs);
+      if (jsTsFiles.length > 0) {
+        warn('No files matched configured include patterns. Falling back to default route/controller presets.');
+      }
+    }
+
+    if (jsTsFiles.length === 0) {
+      jsTsFiles = await autoDiscoverEndpointFiles(cwd, exclude);
+      if (jsTsFiles.length > 0) {
+        warn(`No files matched configured globs. Auto-discovered ${jsTsFiles.length} route/controller candidate file(s).`);
+      }
+    }
 
     info(`Scanning ${jsTsFiles.length} file(s)...`);
     if (jsTsFiles.length === 0) {
@@ -88,6 +104,33 @@ async function syncOnce({ configPath, baseDir, postmanKey, postmanId } = {}) {
     error(err.stack || err.message || String(err));
     process.exitCode = 1;
   }
+}
+
+async function autoDiscoverEndpointFiles(cwd, exclude) {
+  const discovered = await fg(['**/*.{ts,js,tsx,jsx}'], {
+    cwd,
+    absolute: true,
+    dot: false,
+    ignore: exclude
+  });
+
+  const candidates = discovered.filter((file) => {
+    const normalized = file.replace(/\\/g, '/').toLowerCase();
+    const base = path.basename(normalized);
+
+    if (!isJsOrTs(file)) return false;
+    if (base.endsWith('.d.ts') || base.endsWith('.d.tsx')) return false;
+
+    if (/(^|\.)(routes?|router|controller)\.(t|j)sx?$/.test(base)) return true;
+    if (/grpc.*controller\.(t|j)sx?$/.test(base)) return true;
+    if (/\/routes?\//.test(normalized) && /\.(t|j)sx?$/.test(base)) return true;
+    if (/\/controllers?\//.test(normalized) && /\.(t|j)sx?$/.test(base)) return true;
+
+    return false;
+  });
+
+  // Keep deterministic order and remove duplicates
+  return Array.from(new Set(candidates)).sort();
 }
 
 async function readJsonIfExists(filePath) {
