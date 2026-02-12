@@ -23,6 +23,69 @@ function parseCsv(input) {
     .filter(Boolean);
 }
 
+function parseAppBaseUrls(input) {
+  const entries = parseCsv(input);
+  const map = {};
+  for (const entry of entries) {
+    const idx = entry.indexOf('=');
+    if (idx <= 0) continue;
+    const app = entry.slice(0, idx).trim();
+    const url = entry.slice(idx + 1).trim();
+    if (!app || !url) continue;
+    map[app] = url;
+  }
+  return map;
+}
+
+function stringifyAppBaseUrls(appMap) {
+  return Object.entries(appMap || {})
+    .map(([app, url]) => `${app}=${url}`)
+    .join(',');
+}
+
+function normalizeAppName(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+function defaultAppBaseUrls(appNames, startPort = 8000) {
+  const map = {};
+  appNames.forEach((appName, idx) => {
+    map[appName] = `http://localhost:${startPort + idx}/api`;
+  });
+  return map;
+}
+
+async function detectAppNames(projectDir) {
+  const files = await fg(
+    [
+      'apps/*/src/**/*.{ts,js}',
+      'services/*/src/**/*.{ts,js}',
+      'src/apps/*/**/*.{ts,js}',
+      'src/services/*/**/*.{ts,js}'
+    ],
+    {
+      cwd: projectDir,
+      dot: false,
+      absolute: false,
+      ignore: ['**/node_modules/**', '**/dist/**', '**/build/**']
+    }
+  );
+
+  const names = new Set();
+  for (const file of files) {
+    const match = file.match(/(?:^|\/)(?:apps|services)\/([^/]+)\//i);
+    if (!match || !match[1]) continue;
+    const normalized = normalizeAppName(match[1]);
+    if (normalized) names.add(normalized);
+  }
+
+  return Array.from(names).sort();
+}
+
 function prettyFramework(framework) {
   if (framework === 'nestjs') return 'NestJS';
   if (framework === 'express') return 'Express';
@@ -153,11 +216,15 @@ async function initConfig({ baseDir } = {}) {
   }
 
   const detected = await detectFramework(projectDir);
+  const detectedApps = await detectAppNames(projectDir);
   if (detected.framework !== 'auto') {
     const grpcNote = detected.grpcDetected ? ' + gRPC/microservice controllers' : '';
     info(`Detected framework: ${prettyFramework(detected.framework)}${grpcNote}`);
   } else {
     info(detected.reason);
+  }
+  if (detectedApps.length > 1) {
+    info(`Detected multi-app layout: ${detectedApps.join(', ')}`);
   }
 
   const frameworkChoices = [
@@ -166,6 +233,10 @@ async function initConfig({ baseDir } = {}) {
     { name: 'Express', value: 'express' },
     { name: 'Hono', value: 'hono' }
   ];
+
+  const defaultBaseUrlMode = (detectedApps.length > 1 || detected.grpcDetected) ? 'multi' : 'single';
+  const suggestedApps = detectedApps.length ? detectedApps : ['app1', 'app2'];
+  const suggestedMultiBaseUrls = stringifyAppBaseUrls(defaultAppBaseUrls(suggestedApps));
 
   const answers = await prompt([
     {
@@ -196,10 +267,34 @@ async function initConfig({ baseDir } = {}) {
       when: (a) => a.advanced
     },
     {
+      type: 'list',
+      name: 'baseUrlMode',
+      message: 'How should base URLs be configured?',
+      choices: [
+        { name: 'Single base URL (one app)', value: 'single' },
+        { name: 'Multiple app URLs (microservices)', value: 'multi' }
+      ],
+      default: defaultBaseUrlMode
+    },
+    {
       type: 'input',
       name: 'baseUrl',
       message: 'Base URL for collections:',
-      default: DEFAULT_CONFIG.sources.baseUrl
+      default: DEFAULT_CONFIG.sources.baseUrl,
+      when: (a) => a.baseUrlMode === 'single'
+    },
+    {
+      type: 'input',
+      name: 'appBaseUrls',
+      message: 'App base URLs (app=url, comma-separated):',
+      default: suggestedMultiBaseUrls,
+      when: (a) => a.baseUrlMode === 'multi',
+      validate: (value) => {
+        const parsed = parseAppBaseUrls(value);
+        return Object.keys(parsed).length > 0
+          ? true
+          : 'Provide at least one pair like auth=http://localhost:8000/api';
+      }
     },
     {
       type: 'confirm',
@@ -235,13 +330,20 @@ async function initConfig({ baseDir } = {}) {
   const exclude = answers.advanced
     ? parseCsv(answers.exclude)
     : DEFAULT_CONFIG.sources.exclude;
+  const appBaseUrls = answers.baseUrlMode === 'multi'
+    ? parseAppBaseUrls(answers.appBaseUrls)
+    : undefined;
+  const baseUrl = answers.baseUrlMode === 'multi'
+    ? (Object.values(appBaseUrls)[0] || DEFAULT_CONFIG.sources.baseUrl)
+    : answers.baseUrl;
 
   const config = {
     framework: answers.framework,
     sources: {
       include,
       exclude,
-      baseUrl: answers.baseUrl
+      baseUrl,
+      ...(appBaseUrls ? { appBaseUrls } : {})
     },
     output: {
       postman: {
