@@ -3,12 +3,34 @@ const { extractExpressEndpoints } = require('./express');
 const { extractHonoEndpoints } = require('./hono');
 
 async function extractEndpoints(filePath, framework) {
-  if (framework === 'nestjs') return extractNestJsEndpoints(filePath);
-  if (framework === 'express') return extractExpressEndpoints(filePath);
+  if (framework === 'nestjs') {
+    try {
+      return await extractNestJsEndpoints(filePath);
+    } catch {
+      return [];
+    }
+  }
+  if (framework === 'express') {
+    try {
+      return await extractExpressEndpoints(filePath);
+    } catch {
+      return [];
+    }
+  }
   if (framework === 'hono') return [];
   // auto: try NestJS then Express
-  const nest = await extractNestJsEndpoints(filePath);
-  const exp = await extractExpressEndpoints(filePath);
+  let nest = [];
+  let exp = [];
+  try {
+    nest = await extractNestJsEndpoints(filePath);
+  } catch {
+    nest = [];
+  }
+  try {
+    exp = await extractExpressEndpoints(filePath);
+  } catch {
+    exp = [];
+  }
   const map = new Map();
   for (const e of [...nest, ...exp]) map.set(e.key, e);
   return Array.from(map.values());
