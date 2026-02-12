@@ -7,6 +7,7 @@ const { resolveZodSchema } = require('./zod');
 
 const ROUTER_CLASS_NAMES = new Set(['Hono', 'OpenAPIHono']);
 const HONO_METHODS = new Set([...HTTP_METHODS, 'all']);
+const ALLOWED_ON_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD']);
 
 function getStringLiteral(node) {
   if (!node) return '';
@@ -20,6 +21,7 @@ function getStringLiteral(node) {
 function getPropertyName(node) {
   if (!node) return null;
   if (node.type === 'Identifier') return node.name;
+  if (node.type === 'StringLiteral') return node.value;
   return null;
 }
 
@@ -123,8 +125,9 @@ function parseRequestSchema(node, schemaDefs) {
   const schema = { query: null, params: null, body: null };
 
   for (const prop of node.properties || []) {
-    if (prop.type !== 'ObjectProperty' || prop.key.type !== 'Identifier') continue;
-    const key = prop.key.name;
+    if (prop.type !== 'ObjectProperty') continue;
+    const key = getPropertyName(prop.key);
+    if (!key) continue;
 
     if (key === 'query') {
       schema.query = resolveZodSchema(prop.value, schemaDefs);
@@ -136,15 +139,18 @@ function parseRequestSchema(node, schemaDefs) {
       const bodyDef = prop.value;
       if (bodyDef.type === 'ObjectExpression') {
         for (const bodyProp of bodyDef.properties || []) {
-          if (bodyProp.key && bodyProp.key.name === 'content') {
+          const bodyPropKey = bodyProp.key ? getPropertyName(bodyProp.key) : null;
+          if (bodyPropKey === 'content') {
             const content = bodyProp.value;
             if (content.type === 'ObjectExpression') {
               for (const contentProp of content.properties || []) {
-                if (contentProp.key && contentProp.key.name === 'application/json') {
+                const contentKey = contentProp.key ? getPropertyName(contentProp.key) : null;
+                if (contentKey === 'application/json') {
                   const jsonDef = contentProp.value;
                   if (jsonDef.type === 'ObjectExpression') {
                     for (const jsonProp of jsonDef.properties || []) {
-                      if (jsonProp.key && jsonProp.key.name === 'schema') {
+                      const jsonPropKey = jsonProp.key ? getPropertyName(jsonProp.key) : null;
+                      if (jsonPropKey === 'schema') {
                         schema.body = resolveZodSchema(jsonProp.value, schemaDefs);
                       }
                     }
@@ -220,13 +226,31 @@ function parseMethodsFromOn(node) {
   const methods = [];
   if (!methodsArg) return methods;
   if (methodsArg.type === 'StringLiteral') {
-    methods.push(methodsArg.value.toUpperCase());
+    const method = methodsArg.value.toUpperCase();
+    if (ALLOWED_ON_METHODS.has(method)) methods.push(method);
   } else if (methodsArg.type === 'ArrayExpression') {
     for (const el of methodsArg.elements || []) {
-      if (el && el.type === 'StringLiteral') methods.push(el.value.toUpperCase());
+      if (!el || el.type !== 'StringLiteral') continue;
+      const method = el.value.toUpperCase();
+      if (ALLOWED_ON_METHODS.has(method)) methods.push(method);
     }
   }
   return methods;
+}
+
+function middlewareNameFromNode(node) {
+  if (!node) return null;
+  if (node.type === 'Identifier') return node.name;
+  if (node.type === 'CallExpression') {
+    if (node.callee.type === 'Identifier') return node.callee.name;
+    if (node.callee.type === 'MemberExpression') {
+      if (node.callee.property.type === 'Identifier') return node.callee.property.name;
+    }
+  }
+  if (node.type === 'MemberExpression' && node.property.type === 'Identifier') {
+    return node.property.name;
+  }
+  return null;
 }
 
 function parseValidatorArgs(args, schemaDefs) {
@@ -265,8 +289,10 @@ function extractParameters(requestSchema) {
       for (const [key, val] of Object.entries(requestSchema.params.properties)) {
         pathParams.push({
           name: key,
+          key,
           required: true,
-          type: val.type || 'string'
+          type: val.type || 'string',
+          example: val.example
         });
       }
     }
@@ -375,6 +401,7 @@ async function parseHonoFile(filePath) {
               const routePath = getStringLiteral(call.args[0]);
               if (routePath) {
                 const params = {};
+                const middleware = [];
                 for (const arg of call.args.slice(1)) {
                   if (arg.type === 'CallExpression' && arg.callee.name === 'zValidator') {
                     const res = parseValidatorArgs(arg.arguments, schemaDefs);
@@ -384,12 +411,22 @@ async function parseHonoFile(filePath) {
                         const queryParams = [];
                         if (res.schema.properties) {
                           for (const [key, val] of Object.entries(res.schema.properties)) {
-                            queryParams.push({ name: key, required: !val.optional });
+                            queryParams.push({
+                              name: key,
+                              key,
+                              required: !val.optional,
+                              type: val.type || 'string',
+                              example: val.example
+                            });
                           }
                         }
                         params.query = queryParams;
                       }
                     }
+                  }
+                  const middlewareName = middlewareNameFromNode(arg);
+                  if (middlewareName && middlewareName !== 'zValidator') {
+                    middleware.push(middlewareName);
                   }
                 }
 
@@ -398,6 +435,7 @@ async function parseHonoFile(filePath) {
                   method,
                   path: routePath,
                   description: `${method} ${routePath}`,
+                  middleware,
                   parameters: params
                 });
               }
@@ -462,6 +500,7 @@ async function parseHonoFile(filePath) {
           const routePath = getStringLiteral(node.arguments[0]);
           if (routePath) {
             const params = {};
+            const middleware = [];
             for (const arg of node.arguments.slice(1)) {
               if (arg.type === 'CallExpression' && arg.callee.name === 'zValidator') {
                 const res = parseValidatorArgs(arg.arguments, schemaDefs);
@@ -471,12 +510,22 @@ async function parseHonoFile(filePath) {
                     const queryParams = [];
                     if (res.schema.properties) {
                       for (const [key, val] of Object.entries(res.schema.properties)) {
-                        queryParams.push({ name: key, required: !val.optional });
+                        queryParams.push({
+                          name: key,
+                          key,
+                          required: !val.optional,
+                          type: val.type || 'string',
+                          example: val.example
+                        });
                       }
                     }
                     params.query = queryParams;
                   }
                 }
+              }
+              const middlewareName = middlewareNameFromNode(arg);
+              if (middlewareName && middlewareName !== 'zValidator') {
+                middleware.push(middlewareName);
               }
             }
 
@@ -485,6 +534,7 @@ async function parseHonoFile(filePath) {
               method,
               path: routePath,
               description: `${method} ${routePath}`,
+              middleware,
               parameters: params
             });
           }
