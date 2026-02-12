@@ -5,11 +5,23 @@ const fg = require('fast-glob');
 const { DEFAULT_CONFIG, resolveConfigPath } = require('./config');
 const { info, warn, success } = require('./log');
 
+const APP_ROOTS = ['src', 'apps/**/src', 'services/**/src', 'libs/**/src'];
+
+function buildPatterns(templates) {
+  const out = [];
+  for (const root of APP_ROOTS) {
+    for (const tpl of templates) {
+      out.push(`${root}/${tpl}`);
+    }
+  }
+  return Array.from(new Set(out));
+}
+
 const FRAMEWORK_PRESETS = {
-  auto: ['src/**/routes.ts', 'src/**/*.routes.ts', 'src/**/*.controller.ts'],
-  nestjs: ['src/**/*.controller.ts', 'src/**/routes.ts', 'src/**/*.routes.ts'],
-  express: ['src/**/routes.{js,ts}', 'src/**/*.routes.{js,ts}', 'src/**/*router.{js,ts}'],
-  hono: ['src/**/routes.ts', 'src/**/*.routes.ts', 'src/**/*.route.ts']
+  auto: buildPatterns(['**/routes.{js,ts}', '**/*.routes.{js,ts}', '**/*.controller.ts', '**/*router.{js,ts}']),
+  nestjs: buildPatterns(['**/*.controller.ts', '**/routes.ts', '**/*.routes.ts']),
+  express: buildPatterns(['**/routes.{js,ts}', '**/*.routes.{js,ts}', '**/*router.{js,ts}']),
+  hono: buildPatterns(['**/routes.{js,ts}', '**/*.routes.{js,ts}', '**/*.route.{js,ts}'])
 };
 
 function getPrompt() {
@@ -139,19 +151,19 @@ async function detectFramework(projectDir) {
 
   const files = await fg(
     [
-      'src/**/*.controller.ts',
-      'src/**/*.routes.ts',
-      'src/**/routes.ts',
-      'src/**/*router.{js,ts}',
-      'src/**/*hono*.{js,ts}',
-      'src/**/*grpc*.controller.ts',
+      '**/*.controller.ts',
+      '**/*.routes.{js,ts}',
+      '**/routes.{js,ts}',
+      '**/*router.{js,ts}',
+      '**/*hono*.{js,ts}',
+      '**/*grpc*.controller.ts',
       '**/*.proto'
     ],
     {
       cwd: projectDir,
       dot: false,
       absolute: false,
-      ignore: ['**/node_modules/**', '**/dist/**', '**/build/**']
+      ignore: ['**/node_modules/**', '**/dist/**', '**/build/**', '**/.next/**', '**/.nuxt/**', '**/.git/**']
     }
   );
 
