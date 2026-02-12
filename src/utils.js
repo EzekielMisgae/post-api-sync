@@ -29,10 +29,12 @@ function extractPathParams(p) {
 }
 
 function toPostmanPath(p) {
-  return p.replace(/{(\w+)}/g, ':$1');
+  // Convert {param} to {{param}} for Postman variables
+  return p.replace(/{(\w+)}/g, '{{$1}}');
 }
 
 function splitPath(p) {
+  // Keep {{param}} intact when splitting
   return normalizePath(p).split('/').filter(Boolean);
 }
 
