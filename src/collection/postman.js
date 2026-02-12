@@ -4,15 +4,104 @@ const { normalizePath, toPostmanPath, splitPath, extractPathParams } = require('
 
 const DEFAULT_COLLECTION_NAME = 'API Collection';
 const UUID_SAMPLE = '3fa85f64-5717-4562-b3fc-2c963f66afa6';
+const DEFAULT_BASE_URL = 'http://localhost:3000/api';
+
+function normalizeAppName(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '');
+}
+
+function normalizeAppVariableKey(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '') || 'app';
+}
+
+function resolveAppBaseUrls(config) {
+  const configured = config && config.sources && config.sources.appBaseUrls;
+  if (!configured || typeof configured !== 'object' || Array.isArray(configured)) {
+    return [];
+  }
+
+  return Object.entries(configured)
+    .map(([name, url]) => [String(name || '').trim(), String(url || '').trim()])
+    .filter(([name, url]) => !!name && !!url);
+}
+
+function resolveBaseUrl(config, appBaseUrls) {
+  if (config && config.sources && config.sources.baseUrl) return config.sources.baseUrl;
+  if (appBaseUrls.length) return appBaseUrls[0][1];
+  return DEFAULT_BASE_URL;
+}
+
+function buildAppBaseUrlMap(appBaseUrls) {
+  const appVarMap = new Map();
+  for (const [appName] of appBaseUrls) {
+    const appKey = normalizeAppName(appName);
+    if (!appKey) continue;
+    appVarMap.set(appKey, `baseUrl_${normalizeAppVariableKey(appName)}`);
+  }
+  return appVarMap;
+}
+
+function resolveEndpointBaseVarKey(endpoint, appVarMap) {
+  if (!appVarMap || appVarMap.size === 0) return 'baseUrl';
+
+  const directApp = normalizeAppName(endpoint.app);
+  if (directApp && appVarMap.has(directApp)) {
+    return appVarMap.get(directApp);
+  }
+
+  const filePath = String(endpoint.filePath || '');
+  if (!filePath) return 'baseUrl';
+
+  const segments = filePath.split(path.sep).filter(Boolean);
+  for (let i = 0; i < segments.length; i += 1) {
+    const current = segments[i].toLowerCase();
+    if ((current === 'apps' || current === 'services') && segments[i + 1]) {
+      const appName = normalizeAppName(segments[i + 1]);
+      if (appVarMap.has(appName)) return appVarMap.get(appName);
+    }
+  }
+
+  for (const segment of segments) {
+    const appName = normalizeAppName(segment);
+    if (appVarMap.has(appName)) return appVarMap.get(appName);
+  }
+
+  return 'baseUrl';
+}
 
 function buildPostmanCollection(endpoints, config) {
   const name = (config.output && config.output.postman && config.output.postman.collectionName) || DEFAULT_COLLECTION_NAME;
-  const baseUrl = (config.sources && config.sources.baseUrl) || 'http://localhost:3000/api';
+  const appBaseUrls = resolveAppBaseUrls(config);
+  const baseUrl = resolveBaseUrl(config, appBaseUrls);
+  const appVarMap = buildAppBaseUrlMap(appBaseUrls);
   const groupBy = (config.organization && config.organization.groupBy) || 'folder';
 
   const items = groupBy === 'folder'
-    ? buildFolderItems(endpoints)
-    : buildTaggedItems(endpoints);
+    ? buildFolderItems(endpoints, appVarMap)
+    : buildTaggedItems(endpoints, appVarMap);
+
+  const variables = [
+    { key: 'baseUrl', value: baseUrl, type: 'string' },
+    { key: 'authToken', value: '', type: 'string' },
+    { key: 'userId', value: '', type: 'string' },
+    { key: 'orderId', value: '', type: 'string' },
+    { key: 'wholesaleCustomerId', value: '', type: 'string' }
+  ];
+
+  for (const [appName, appUrl] of appBaseUrls) {
+    variables.push({
+      key: `baseUrl_${normalizeAppVariableKey(appName)}`,
+      value: appUrl,
+      type: 'string'
+    });
+  }
 
   return {
     info: {
@@ -20,18 +109,12 @@ function buildPostmanCollection(endpoints, config) {
       name,
       schema: 'https://schema.getpostman.com/json/collection/v2.1.0/collection.json'
     },
-    variable: [
-      { key: 'baseUrl', value: baseUrl, type: 'string' },
-      { key: 'authToken', value: '', type: 'string' },
-      { key: 'userId', value: '', type: 'string' },
-      { key: 'orderId', value: '', type: 'string' },
-      { key: 'wholesaleCustomerId', value: '', type: 'string' }
-    ],
+    variable: variables,
     item: items
   };
 }
 
-function buildFolderItems(endpoints) {
+function buildFolderItems(endpoints, appVarMap) {
   const folders = new Map();
 
   for (const endpoint of endpoints) {
@@ -39,19 +122,19 @@ function buildFolderItems(endpoints) {
     if (!folders.has(folderName)) {
       folders.set(folderName, { name: folderName, item: [] });
     }
-    folders.get(folderName).item.push(buildItem(endpoint));
+    folders.get(folderName).item.push(buildItem(endpoint, appVarMap));
   }
 
   return Array.from(folders.values());
 }
 
-function buildTaggedItems(endpoints) {
+function buildTaggedItems(endpoints, appVarMap) {
   const groups = new Map();
   for (const endpoint of endpoints) {
     const tags = endpoint.tags && endpoint.tags.length ? endpoint.tags : ['General'];
     const tag = cleanLabel(tags[0] || 'General');
     if (!groups.has(tag)) groups.set(tag, []);
-    groups.get(tag).push(buildItem(endpoint));
+    groups.get(tag).push(buildItem(endpoint, appVarMap));
   }
 
   const items = [];
@@ -61,10 +144,12 @@ function buildTaggedItems(endpoints) {
   return items;
 }
 
-function buildItem(endpoint) {
+function buildItem(endpoint, appVarMap) {
   const originalPath = normalizePath(endpoint.path || '/');
   const postmanPath = toPostmanPath(originalPath);
   const displayPath = toDisplayPath(originalPath);
+  const baseVarKey = resolveEndpointBaseVarKey(endpoint, appVarMap);
+  const baseVarToken = `{{${baseVarKey}}}`;
 
   const queryParams = buildQueryParams((endpoint.parameters && endpoint.parameters.query) || []);
   const pathVariables = buildPathVariables(postmanPath, endpoint);
@@ -80,10 +165,10 @@ function buildItem(endpoint) {
     headers.push({ key: 'Authorization', value: 'Bearer {{authToken}}', type: 'text' });
   }
 
-  const rawUrl = buildRawUrl(postmanPath, queryParams);
+  const rawUrl = buildRawUrl(postmanPath, queryParams, baseVarToken);
   const url = {
     raw: rawUrl,
-    host: ['{{baseUrl}}'],
+    host: [baseVarToken],
     path: splitPath(postmanPath)
   };
 
@@ -386,8 +471,8 @@ function buildPathVariables(postmanPath, endpoint) {
   });
 }
 
-function buildRawUrl(postmanPath, queryParams) {
-  let raw = `{{baseUrl}}${postmanPath}`;
+function buildRawUrl(postmanPath, queryParams, baseVarToken = '{{baseUrl}}') {
+  let raw = `${baseVarToken}${postmanPath}`;
   const queryString = (queryParams || [])
     .filter((q) => !q.disabled)
     .map((q) => `${q.key}=${q.value || ''}`)
