@@ -30,6 +30,7 @@ npx post-api-sync --help
     npx post-api-sync init
     ```
     This will create an `post-api-sync.config.js` file in your project root.
+    The init flow auto-detects framework (NestJS/Express/Hono), applies recommended include globs, and supports an advanced mode if you want to customize globs manually.
 
 2.  **Run extraction**:
     ```bash
