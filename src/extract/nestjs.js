@@ -25,6 +25,7 @@ const TYPE_DECORATORS = new Map([
   ['Max', 'number'],
   ['IsBoolean', 'boolean']
 ]);
+const AUTH_DECORATORS = new Set(['ApiBearerAuth', 'UseGuards', 'Auth', 'Roles', 'Permissions']);
 
 function getDecoratorName(dec) {
   const expr = dec.expression;
@@ -62,17 +63,40 @@ function getTagsFromDecorator(dec) {
   return tags;
 }
 
-function getSummaryFromDecorator(dec) {
+function getApiOperationMeta(dec) {
   const args = getDecoratorArgs(dec);
   const first = args[0];
-  if (!first || first.type !== 'ObjectExpression') return null;
+  if (!first || first.type !== 'ObjectExpression') return { summary: null, description: null };
+  let summary = null;
+  let description = null;
   for (const prop of first.properties) {
     if (prop.type !== 'ObjectProperty') continue;
-    if (prop.key.type === 'Identifier' && prop.key.name === 'summary') {
-      if (prop.value.type === 'StringLiteral') return prop.value.value;
+    if (prop.key.type !== 'Identifier') continue;
+    if (prop.key.name === 'summary' && prop.value.type === 'StringLiteral') {
+      summary = prop.value.value;
+    }
+    if (prop.key.name === 'description' && prop.value.type === 'StringLiteral') {
+      description = prop.value.value;
     }
   }
-  return null;
+  return { summary, description };
+}
+
+function hasAuthDecorator(dec) {
+  const name = getDecoratorName(dec);
+  if (!name) return false;
+  if (AUTH_DECORATORS.has(name)) {
+    if (name !== 'UseGuards') return true;
+    const args = getDecoratorArgs(dec);
+    return args.some((arg) => {
+      if (arg.type === 'Identifier') return /auth|jwt|role|permission|guard/i.test(arg.name);
+      if (arg.type === 'CallExpression' && arg.callee.type === 'Identifier') {
+        return /auth|jwt|role|permission|guard/i.test(arg.callee.name);
+      }
+      return false;
+    });
+  }
+  return /auth|jwt|guard|role|permission/i.test(name);
 }
 
 function getPropertyName(node) {
@@ -291,11 +315,11 @@ function getParamDecorators(paramNode, dtoSchemas) {
     if (!name) continue;
     const arg = getStringArg(dec);
     if (name === 'Param') {
-      if (arg) params.push({ name: arg, required: true });
+      if (arg) params.push({ name: arg, key: arg, required: true, type: 'string' });
     }
     if (name === 'Query') {
       if (arg) {
-        query.push({ name: arg, required: false });
+        query.push({ name: arg, key: arg, required: false, type: 'string' });
       } else {
         // @Query() query: SearchDto
         // Check if there is a type annotation that maps to a DTO
@@ -309,7 +333,13 @@ function getParamDecorators(paramNode, dtoSchemas) {
             for (const [key, val] of Object.entries(schema.properties)) {
               // Determine if required based on schema.required array
               const isRequired = schema.required && schema.required.includes(key);
-              query.push({ name: key, required: !!isRequired });
+              query.push({
+                name: key,
+                key,
+                required: !!isRequired,
+                type: val.type || 'string',
+                example: val.example
+              });
             }
           }
         }
@@ -335,6 +365,7 @@ async function extractNestJsEndpoints(filePath) {
       const decorators = classNode.decorators || [];
       let basePath = '';
       let tags = [];
+      let classAuth = false;
       for (const dec of decorators) {
         const name = getDecoratorName(dec);
         if (name === 'Controller') {
@@ -343,6 +374,7 @@ async function extractNestJsEndpoints(filePath) {
         if (name === 'ApiTags') {
           tags = tags.concat(getTagsFromDecorator(dec));
         }
+        if (hasAuthDecorator(dec)) classAuth = true;
       }
 
       const body = classNode.body.body || [];
@@ -358,17 +390,24 @@ async function extractNestJsEndpoints(filePath) {
         const methodDecorators = memberNode.decorators || [];
         let httpMethod = null;
         let methodPath = '';
+        let summary = null;
         let description = null;
+        let methodAuth = false;
+        const decoratorNames = [];
 
         for (const dec of methodDecorators) {
           const name = getDecoratorName(dec);
+          if (name) decoratorNames.push(name);
           if (HTTP_DECORATORS[name]) {
             httpMethod = HTTP_DECORATORS[name];
             methodPath = getStringArg(dec);
           }
           if (name === 'ApiOperation') {
-            description = getSummaryFromDecorator(dec) || description;
+            const apiOp = getApiOperationMeta(dec);
+            summary = apiOp.summary || summary;
+            description = apiOp.description || description;
           }
+          if (hasAuthDecorator(dec)) methodAuth = true;
         }
 
         if (!httpMethod) continue;
@@ -389,8 +428,11 @@ async function extractNestJsEndpoints(filePath) {
         const endpoint = {
           method: httpMethod,
           path: fullPath,
+          summary: summary || undefined,
           description: description || `${httpMethod} ${fullPath}`,
           tags: tags.length ? tags : undefined,
+          decorators: decoratorNames,
+          auth: classAuth || methodAuth || undefined,
           parameters: {
             path: params.length ? params : undefined,
             query: query.length ? query : undefined,
