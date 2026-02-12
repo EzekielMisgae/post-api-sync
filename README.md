@@ -30,7 +30,7 @@ npx post-api-sync --help
     npx post-api-sync init
     ```
     This will create an `post-api-sync.config.js` file in your project root.
-    The init flow auto-detects framework (NestJS/Express/Hono), applies recommended include globs, supports multi-app base URLs (e.g. ports 8000-8003), and has an advanced mode for manual glob customization.
+    The init flow auto-detects framework (NestJS/Express/Hono), supports multi-app base URLs (e.g. ports 3000-3003), and uses monorepo-ready include patterns (`src`, `apps/*/src`, `services/*/src`, `libs/*/src`) by default.
 
 2.  **Run extraction**:
     ```bash
@@ -86,6 +86,7 @@ module.exports = {
 ```
 
 When `sources.appBaseUrls` is set, generated requests automatically use app-specific variables like `{{baseUrl_orders}}` based on endpoint file paths (for example `apps/orders/...`).
+If configured include globs match no files, sync now auto-discovers route/controller candidates across the repository (while ignoring build/dependency folders), so unusual project layouts still work without manual glob updates.
 
 ### Environment Variables
 You can use a `.env` file in your project root to store sensitive keys:
