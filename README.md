@@ -56,7 +56,7 @@ module.exports = {
     // Glob patterns to exclude
     exclude: ['**/*.test.ts'],
     // Base URL for variables in collections
-    baseUrl: 'http://localhost:3000'
+    baseUrl: 'http://localhost:3000/api'
   },
 
   organization: {
