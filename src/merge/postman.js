@@ -125,7 +125,10 @@ function keyFromPostmanItem(item) {
   if (url.raw) raw = url.raw;
   let path = '';
   if (raw) {
-    path = raw.replace(/\{\{\s*baseUrl\s*\}\}/i, '').split('?')[0].split('#')[0];
+    path = raw
+      .replace(/\{\{\s*baseUrl(?:_[A-Za-z0-9_]+)?\s*\}\}/ig, '')
+      .split('?')[0]
+      .split('#')[0];
   } else if (Array.isArray(url.path)) {
     path = `/${url.path.join('/')}`;
   }
