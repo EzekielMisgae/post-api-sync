@@ -3,10 +3,29 @@ const fs = require('fs-extra');
 
 const ALWAYS_EXCLUDE = ['**/node_modules/**', '**/dist/**', '**/build/**', '**/*.d.ts'];
 
+const DEFAULT_INCLUDE = [
+  'src/**/routes.{js,ts}',
+  'src/**/*.routes.{js,ts}',
+  'src/**/*.controller.ts',
+  'src/**/*router.{js,ts}',
+  'apps/**/src/**/routes.{js,ts}',
+  'apps/**/src/**/*.routes.{js,ts}',
+  'apps/**/src/**/*.controller.ts',
+  'apps/**/src/**/*router.{js,ts}',
+  'services/**/src/**/routes.{js,ts}',
+  'services/**/src/**/*.routes.{js,ts}',
+  'services/**/src/**/*.controller.ts',
+  'services/**/src/**/*router.{js,ts}',
+  'libs/**/src/**/routes.{js,ts}',
+  'libs/**/src/**/*.routes.{js,ts}',
+  'libs/**/src/**/*.controller.ts',
+  'libs/**/src/**/*router.{js,ts}'
+];
+
 const DEFAULT_CONFIG = {
   framework: 'auto',
   sources: {
-    include: ['src/**/routes.ts', 'src/**/*.routes.ts', 'src/**/*.controller.ts'],
+    include: DEFAULT_INCLUDE,
     exclude: ['**/*.spec.ts', '**/*.test.ts', 'node_modules/**', 'dist/**', 'build/**'],
     baseUrl: 'http://localhost:3000/api'
   },
@@ -131,6 +150,7 @@ function normalizeExcludePatterns(patterns, baseDir) {
 }
 
 module.exports = {
+  DEFAULT_INCLUDE,
   DEFAULT_CONFIG,
   resolveConfigPath,
   loadConfig,
