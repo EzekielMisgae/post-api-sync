@@ -35,6 +35,44 @@ function getRouteCallInfo(callExpr) {
   return { routerName, routePath };
 }
 
+function getRouteCallInfoFromChain(callExpr) {
+  let current = callExpr;
+  while (current && current.type === 'CallExpression') {
+    const info = getRouteCallInfo(current);
+    if (info) return info;
+    if (current.callee && current.callee.type === 'MemberExpression') {
+      current = current.callee.object;
+    } else {
+      break;
+    }
+  }
+  return null;
+}
+
+function middlewareNameFromNode(node) {
+  if (!node) return null;
+  if (node.type === 'Identifier') return node.name;
+  if (node.type === 'CallExpression') {
+    if (node.callee.type === 'Identifier') return node.callee.name;
+    if (node.callee.type === 'MemberExpression' && node.callee.property.type === 'Identifier') {
+      return node.callee.property.name;
+    }
+  }
+  if (node.type === 'MemberExpression' && node.property.type === 'Identifier') {
+    return node.property.name;
+  }
+  return null;
+}
+
+function collectMiddlewareNames(args) {
+  const middleware = [];
+  for (const arg of args || []) {
+    const name = middlewareNameFromNode(arg);
+    if (name) middleware.push(name);
+  }
+  return Array.from(new Set(middleware));
+}
+
 function collectRouterBases(ast) {
   const baseMap = new Map();
 
@@ -95,7 +133,7 @@ async function extractExpressEndpoints(filePath) {
       // Extract schemas from middleware args
       function extractSchemasFromArgs(args, httpMethod) {
         let body = null;
-        let query = [];
+        const query = [];
 
         for (const arg of args) {
           // Look for middleware calls: validate(schema)
@@ -113,7 +151,13 @@ async function extractExpressEndpoints(filePath) {
                 if (['GET', 'DELETE', 'HEAD'].includes(httpMethod)) {
                   // Likely query params
                   for (const [key, val] of Object.entries(resolved.properties)) {
-                    query.push({ name: key, required: !val.optional });
+                    query.push({
+                      name: key,
+                      key,
+                      required: !val.optional,
+                      type: val.type || 'string',
+                      example: val.example
+                    });
                   }
                 } else {
                   // Likely body
@@ -141,6 +185,7 @@ async function extractExpressEndpoints(filePath) {
 
         const method = methodName.toUpperCase();
         const fullPath = normalizePath(joinPaths(base, routePath));
+        const middleware = collectMiddlewareNames(args.slice(1));
 
         const { body, query } = extractSchemasFromArgs(args.slice(1), method);
 
@@ -148,6 +193,7 @@ async function extractExpressEndpoints(filePath) {
           method,
           path: fullPath,
           description: `${method} ${fullPath}`,
+          middleware,
           parameters: { body, query },
           filePath,
           key: toKey(method, fullPath)
@@ -158,11 +204,12 @@ async function extractExpressEndpoints(filePath) {
       // Handle router.route('/path').get(...)
       if (property.name && isHttpMethod(property.name) && node.callee.object.type === 'CallExpression') {
         const owner = node.callee.object;
-        const routeInfo = getRouteCallInfo(owner);
+        const routeInfo = getRouteCallInfoFromChain(owner);
         if (!routeInfo) return;
         const method = property.name.toUpperCase();
         const base = routerBases.get(routeInfo.routerName) || '';
         const fullPath = normalizePath(joinPaths(base, routeInfo.routePath));
+        const middleware = collectMiddlewareNames(node.arguments);
 
         const { body, query } = extractSchemasFromArgs(node.arguments, method);
 
@@ -170,6 +217,7 @@ async function extractExpressEndpoints(filePath) {
           method,
           path: fullPath,
           description: `${method} ${fullPath}`,
+          middleware,
           parameters: { body, query },
           filePath,
           key: toKey(method, fullPath)
