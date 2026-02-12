@@ -21,6 +21,8 @@ function joinPaths(base, child) {
 
 function extractPathParams(p) {
   const params = new Set();
+  const doubleBraceMatches = p.match(/{{([A-Za-z0-9_]+)}}/g) || [];
+  for (const m of doubleBraceMatches) params.add(m.slice(2, -2));
   const colonMatches = p.match(/:([A-Za-z0-9_]+)/g) || [];
   for (const m of colonMatches) params.add(m.slice(1));
   const braceMatches = p.match(/{([A-Za-z0-9_]+)}/g) || [];
@@ -29,8 +31,16 @@ function extractPathParams(p) {
 }
 
 function toPostmanPath(p) {
-  // Convert {param} to {{param}} for Postman variables
-  return p.replace(/{(\w+)}/g, '{{$1}}');
+  // Convert :param and {param} to {{param}} for Postman variables
+  const normalized = normalizePath(p)
+    .replace(/:([A-Za-z0-9_]+)/g, '{{$1}}');
+
+  return normalized.replace(/{([A-Za-z0-9_]+)}/g, (match, name, offset, full) => {
+    const before = full[offset - 1];
+    const after = full[offset + match.length];
+    if (before === '{' || after === '}') return match;
+    return `{{${name}}}`;
+  });
 }
 
 function splitPath(p) {
