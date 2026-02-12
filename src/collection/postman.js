@@ -81,10 +81,11 @@ function buildPostmanCollection(endpoints, config) {
   const appBaseUrls = resolveAppBaseUrls(config);
   const baseUrl = resolveBaseUrl(config, appBaseUrls);
   const appVarMap = buildAppBaseUrlMap(appBaseUrls);
+  const appFolderOrder = appBaseUrls.map(([name]) => cleanLabel(name));
   const groupBy = (config.organization && config.organization.groupBy) || 'folder';
 
   const items = groupBy === 'folder'
-    ? buildFolderItems(endpoints, appVarMap)
+    ? buildFolderItems(endpoints, appVarMap, appFolderOrder)
     : buildTaggedItems(endpoints, appVarMap);
 
   const variables = [
@@ -114,18 +115,68 @@ function buildPostmanCollection(endpoints, config) {
   };
 }
 
-function buildFolderItems(endpoints, appVarMap) {
-  const folders = new Map();
+function buildFolderItems(endpoints, appVarMap, appFolderOrder = []) {
+  const root = { item: [], _folders: new Map() };
 
   for (const endpoint of endpoints) {
-    const folderName = deriveFolderName(endpoint);
-    if (!folders.has(folderName)) {
-      folders.set(folderName, { name: folderName, item: [] });
-    }
-    folders.get(folderName).item.push(buildItem(endpoint, appVarMap));
+    const folderSegments = deriveFolderSegments(endpoint, appVarMap);
+    insertIntoFolderTree(root, folderSegments, buildItem(endpoint, appVarMap));
   }
 
-  return Array.from(folders.values());
+  const built = finalizeFolderTree(root.item);
+  return sortTopLevelFoldersByAppOrder(built, appFolderOrder);
+}
+
+function insertIntoFolderTree(root, segments, requestItem) {
+  const safeSegments = Array.isArray(segments) && segments.length
+    ? segments
+    : ['General'];
+
+  let node = root;
+  for (const segment of safeSegments) {
+    const name = cleanLabel(segment || 'General');
+    if (!node._folders.has(name)) {
+      const folder = { name, item: [], _folders: new Map() };
+      node._folders.set(name, folder);
+      node.item.push(folder);
+    }
+    node = node._folders.get(name);
+  }
+
+  node.item.push(requestItem);
+}
+
+function finalizeFolderTree(items) {
+  return (items || []).map((item) => {
+    if (item && item._folders) {
+      const out = { ...item, item: finalizeFolderTree(item.item) };
+      delete out._folders;
+      return out;
+    }
+    return item;
+  });
+}
+
+function sortTopLevelFoldersByAppOrder(items, appFolderOrder) {
+  if (!Array.isArray(appFolderOrder) || appFolderOrder.length === 0) {
+    return items;
+  }
+
+  const order = new Map();
+  appFolderOrder.forEach((name, idx) => {
+    order.set(String(name || '').toLowerCase(), idx);
+  });
+
+  return [...items].sort((a, b) => {
+    const aIdx = order.has(String(a && a.name || '').toLowerCase())
+      ? order.get(String(a && a.name || '').toLowerCase())
+      : Number.MAX_SAFE_INTEGER;
+    const bIdx = order.has(String(b && b.name || '').toLowerCase())
+      ? order.get(String(b && b.name || '').toLowerCase())
+      : Number.MAX_SAFE_INTEGER;
+    if (aIdx !== bIdx) return aIdx - bIdx;
+    return String(a && a.name || '').localeCompare(String(b && b.name || ''));
+  });
 }
 
 function buildTaggedItems(endpoints, appVarMap) {
@@ -249,6 +300,143 @@ function deriveFolderName(endpoint) {
   }
 
   return cleanLabel(inferDomainFromPath(endpoint.path || '/'));
+}
+
+function deriveFolderSegments(endpoint, appVarMap) {
+  const filePath = String(endpoint && endpoint.filePath ? endpoint.filePath : '');
+  const appSegments = deriveAppAndModuleSegments(filePath, appVarMap);
+  if (appSegments.length) return appSegments;
+
+  if (endpoint.tags && endpoint.tags.length) {
+    return [cleanLabel(endpoint.tags[0])];
+  }
+
+  return [deriveFolderName(endpoint)];
+}
+
+function splitFilePathSegments(filePath) {
+  return String(filePath || '').split(/[\\/]+/).filter(Boolean);
+}
+
+function normalizeLookupName(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '');
+}
+
+function deriveAppAndModuleSegments(filePath, appVarMap) {
+  if (!filePath) return [];
+
+  const segments = splitFilePathSegments(filePath);
+  if (!segments.length) return [];
+
+  const knownApps = new Set(Array.from((appVarMap && appVarMap.keys()) || []).map(normalizeLookupName));
+  const appInfo = detectAppFromPath(segments, knownApps);
+  if (!appInfo || !appInfo.appNameRaw) return [];
+
+  const appName = cleanLabel(appInfo.appNameRaw);
+  const moduleSegments = deriveModuleSegmentsFromPath(segments, appInfo);
+
+  const out = [appName];
+  for (const segment of moduleSegments) {
+    const cleaned = cleanLabel(segment);
+    if (!cleaned) continue;
+    if (cleaned.toLowerCase() === appName.toLowerCase()) continue;
+    if (out.length && cleaned.toLowerCase() === out[out.length - 1].toLowerCase()) continue;
+    out.push(cleaned);
+  }
+
+  if (out.length === 1) out.push('App');
+  return out;
+}
+
+function detectAppFromPath(segments, knownApps) {
+  const markers = new Set(['apps', 'services']);
+  for (let i = 0; i < segments.length; i += 1) {
+    const seg = String(segments[i] || '').toLowerCase();
+    if (!markers.has(seg)) continue;
+    if (!segments[i + 1]) continue;
+    return {
+      appNameRaw: segments[i + 1],
+      appNameNorm: normalizeLookupName(segments[i + 1]),
+      markerIndex: i
+    };
+  }
+
+  if (knownApps && knownApps.size > 0) {
+    for (let i = 0; i < segments.length; i += 1) {
+      const norm = normalizeLookupName(segments[i]);
+      if (knownApps.has(norm)) {
+        return {
+          appNameRaw: segments[i],
+          appNameNorm: norm,
+          markerIndex: -1
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+function deriveModuleSegmentsFromPath(segments, appInfo) {
+  const filename = segments[segments.length - 1] || '';
+  const pathUntilFile = segments.slice(0, -1);
+
+  const scanStart = appInfo.markerIndex >= 0 ? appInfo.markerIndex + 2 : 0;
+  let srcIndex = -1;
+  for (let i = scanStart; i < pathUntilFile.length; i += 1) {
+    if (String(pathUntilFile[i] || '').toLowerCase() === 'src') {
+      srcIndex = i;
+      break;
+    }
+  }
+
+  const relevant = srcIndex >= 0
+    ? pathUntilFile.slice(srcIndex + 1)
+    : pathUntilFile.slice(scanStart);
+
+  const ignored = new Set([
+    'src', 'modules', 'module', 'routes', 'route', 'controllers', 'controller',
+    'api', 'http', 'grpc', 'rest', 'internal', 'public', 'server', 'main',
+    'dist', 'build', 'domain', 'application', 'infra', 'infrastructure',
+    'shared', 'common', 'handlers', 'handler', 'v1', 'v2', 'v3', 'v4'
+  ]);
+
+  const appNorm = normalizeLookupName(appInfo.appNameNorm || appInfo.appNameRaw);
+  const moduleSegments = [];
+  for (const segment of relevant) {
+    const raw = String(segment || '');
+    const norm = normalizeLookupName(raw);
+    if (!norm) continue;
+    if (ignored.has(raw.toLowerCase())) continue;
+    if (norm === appNorm) continue;
+    moduleSegments.push(raw);
+  }
+
+  if (moduleSegments.length) return moduleSegments;
+
+  const stem = deriveFileStem(filename);
+  if (stem) return [stem];
+  return [];
+}
+
+function deriveFileStem(filename) {
+  let base = String(filename || '').replace(/\.(t|j)sx?$/i, '');
+  if (!base) return '';
+
+  base = base
+    .replace(/\.routes?$/i, '')
+    .replace(/\.controller$/i, '')
+    .replace(/router$/i, '')
+    .replace(/^grpc[._-]?/i, '')
+    .trim();
+
+  if (!base) return '';
+  const low = base.toLowerCase();
+  if (['index', 'routes', 'route', 'controller', 'handler'].includes(low)) return '';
+  return base;
 }
 
 function inferDomainFromPath(routePath) {
