@@ -6,7 +6,7 @@ const ALWAYS_EXCLUDE = ['**/node_modules/**', '**/dist/**', '**/build/**', '**/*
 const DEFAULT_CONFIG = {
   framework: 'auto',
   sources: {
-    include: ['src/**/routes.ts', 'src/**/*.routes.ts'],
+    include: ['src/**/routes.ts', 'src/**/*.routes.ts', 'src/**/*.controller.ts'],
     exclude: ['**/*.spec.ts', '**/*.test.ts', 'node_modules/**', 'dist/**', 'build/**'],
     baseUrl: 'http://localhost:3000/api'
   },
