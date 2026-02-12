@@ -13,9 +13,9 @@ async function syncOnce({ configPath, baseDir, postmanKey, postmanId } = {}) {
   try {
     const { config, baseDir: resolvedBase } = await loadConfig(configPath, baseDir);
     const cwd = resolvedBase || process.cwd();
-    // Use CLI args or config values
-    const pmKey = postmanKey || (config.output && config.output.postman && config.output.postman.apiKey);
-    const pmId = postmanId || (config.output && config.output.postman && config.output.postman.collectionId);
+    // Use CLI args, env vars, or config values
+    const pmKey = postmanKey || process.env.POSTMAN_API_KEY || (config.output && config.output.postman && config.output.postman.apiKey);
+    const pmId = postmanId || process.env.POSTMAN_COLLECTION_ID || (config.output && config.output.postman && config.output.postman.collectionId);
 
     const include = normalizeIncludePatterns(config.sources.include || [], cwd);
     const exclude = Array.from(new Set([
@@ -60,6 +60,7 @@ async function syncOnce({ configPath, baseDir, postmanKey, postmanId } = {}) {
       await fs.outputJson(outPath, merged, { spaces: 2 });
       success(`Postman collection written to ${path.relative(process.cwd(), outPath)}`);
 
+      // Auto-sync checks
       if (pmKey && pmId) {
         info(`Pushing to Postman Cloud (ID: ${pmId})...`);
         try {
@@ -68,6 +69,11 @@ async function syncOnce({ configPath, baseDir, postmanKey, postmanId } = {}) {
         } catch (err) {
           error(`Failed to sync to Postman Cloud: ${err.message}`);
         }
+      } else if (pmKey || pmId) {
+        // Partial keys present
+        warn('Skipping Postman Cloud sync: Missing API Key or Collection ID.');
+        if (!pmKey) warn('  -> POSTMAN_API_KEY is missing');
+        if (!pmId) warn('  -> POSTMAN_COLLECTION_ID is missing');
       }
     }
 
