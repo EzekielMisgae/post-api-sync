@@ -136,6 +136,19 @@ function deriveFolderName(endpoint) {
       return cleanLabel(parent || grandparent || 'General');
     }
 
+    if (base.endsWith('.controller')) {
+      const controllerStem = base.replace(/\.controller$/i, '');
+      if ((parent === 'controllers' || parent === 'controller') && grandparent) {
+        return cleanLabel(grandparent);
+      }
+      if (parent && !['src', 'modules', 'module'].includes(parent.toLowerCase())) {
+        return cleanLabel(parent);
+      }
+      const grpcStem = controllerStem.replace(/^grpc[._-]?/i, '');
+      if (grpcStem && grpcStem !== 'index') return cleanLabel(grpcStem);
+      return cleanLabel(controllerStem || grandparent || 'General');
+    }
+
     if (parent === 'routes') {
       return cleanLabel(base || grandparent || 'General');
     }
