@@ -1,7 +1,9 @@
 const traverse = require('@babel/traverse').default;
 const { parseFile } = require('./ast');
 const { normalizePath, toKey, HTTP_METHODS, joinPaths } = require('../utils');
+const path = require('path');
 const { resolveZodSchema } = require('./zod');
+const { resolveImportFile } = require('./resolve');
 
 function getStringLiteral(node) {
   if (!node) return '';
@@ -73,6 +75,94 @@ function collectMiddlewareNames(args) {
   return Array.from(new Set(middleware));
 }
 
+// Fallback for routers whose creation we can't see (e.g. passed in from another file)
+const ROUTER_NAME_PATTERN = /(app|server|api|router|routes)$/i;
+const ROUTER_TYPE_NAMES = new Set(['Router', 'Express', 'Application', 'IRouter']);
+
+function isRequireExpress(node) {
+  return !!node &&
+    node.type === 'CallExpression' &&
+    node.callee.type === 'Identifier' &&
+    node.callee.name === 'require' &&
+    getStringLiteral(node.arguments[0]) === 'express';
+}
+
+// express(), Router(), express.Router(), require('express')(), require('express').Router()
+function isRouterFactoryCall(node, expressNames, routerFactoryNames) {
+  if (!node || node.type !== 'CallExpression') return false;
+  const { callee } = node;
+  if (callee.type === 'Identifier') {
+    return expressNames.has(callee.name) || routerFactoryNames.has(callee.name);
+  }
+  if (isRequireExpress(callee)) return true;
+  if (callee.type === 'MemberExpression' && callee.property.type === 'Identifier' && callee.property.name === 'Router') {
+    return isRequireExpress(callee.object) ||
+      (callee.object.type === 'Identifier' && expressNames.has(callee.object.name));
+  }
+  return false;
+}
+
+function hasRouterTypeAnnotation(param) {
+  const typeNode = param && param.typeAnnotation && param.typeAnnotation.typeAnnotation;
+  if (!typeNode || typeNode.type !== 'TSTypeReference') return false;
+  const { typeName } = typeNode;
+  if (typeName.type === 'Identifier') return ROUTER_TYPE_NAMES.has(typeName.name);
+  if (typeName.type === 'TSQualifiedName') return ROUTER_TYPE_NAMES.has(typeName.right.name);
+  return false;
+}
+
+function collectRouterNames(ast) {
+  const expressNames = new Set(['express']);
+  const routerFactoryNames = new Set(['Router']);
+  const routers = new Set();
+
+  traverse(ast, {
+    ImportDeclaration(path) {
+      if (path.node.source.value !== 'express') return;
+      for (const spec of path.node.specifiers || []) {
+        if (spec.type === 'ImportDefaultSpecifier' || spec.type === 'ImportNamespaceSpecifier') {
+          expressNames.add(spec.local.name);
+        }
+        if (spec.type === 'ImportSpecifier' && spec.imported.name === 'Router') {
+          routerFactoryNames.add(spec.local.name);
+        }
+      }
+    },
+    VariableDeclarator(path) {
+      const { id, init } = path.node;
+      if (isRequireExpress(init)) {
+        if (id.type === 'Identifier') expressNames.add(id.name);
+        if (id.type === 'ObjectPattern') {
+          for (const prop of id.properties) {
+            if (prop.type === 'ObjectProperty' && prop.key.name === 'Router' && prop.value.type === 'Identifier') {
+              routerFactoryNames.add(prop.value.name);
+            }
+          }
+        }
+        return;
+      }
+      if (id.type === 'Identifier' && isRouterFactoryCall(init, expressNames, routerFactoryNames)) {
+        routers.add(id.name);
+      }
+    },
+    Function(path) {
+      for (const param of path.node.params || []) {
+        if (param.type === 'Identifier' && hasRouterTypeAnnotation(param)) routers.add(param.name);
+      }
+    }
+  });
+
+  return routers;
+}
+
+function isRouterName(name, knownRouters) {
+  return !!name && (knownRouters.has(name) || ROUTER_NAME_PATTERN.test(name));
+}
+
+function looksLikeRoutePath(routePath) {
+  return routePath.startsWith('/') || routePath === '*';
+}
+
 function collectRouterBases(ast) {
   const baseMap = new Map();
 
@@ -107,6 +197,8 @@ async function extractExpressEndpoints(filePath) {
   const ast = await parseFile(filePath);
   const endpoints = [];
   const routerBases = collectRouterBases(ast);
+  const knownRouters = collectRouterNames(ast);
+  for (const name of routerBases.keys()) knownRouters.add(name);
   const schemaDefs = new Map();
 
   // First pass: collect potential schemas
@@ -175,10 +267,13 @@ async function extractExpressEndpoints(filePath) {
         const args = node.arguments || [];
         if (!args.length) return;
         const routePath = getStringLiteral(args[0]);
-        if (!routePath) return;
+        if (!routePath || !looksLikeRoutePath(routePath)) return;
+
+        const ownerName = getMemberObjectName(node.callee);
+        // Skip look-alikes such as cache.get('key') or params.delete('id')
+        if (!isRouterName(ownerName, knownRouters)) return;
 
         let base = '';
-        const ownerName = getMemberObjectName(node.callee);
         if (ownerName && routerBases.has(ownerName)) {
           base = routerBases.get(ownerName);
         }
@@ -206,6 +301,7 @@ async function extractExpressEndpoints(filePath) {
         const owner = node.callee.object;
         const routeInfo = getRouteCallInfoFromChain(owner);
         if (!routeInfo) return;
+        if (!looksLikeRoutePath(routeInfo.routePath) || !isRouterName(routeInfo.routerName, knownRouters)) return;
         const method = property.name.toUpperCase();
         const base = routerBases.get(routeInfo.routerName) || '';
         const fullPath = normalizePath(joinPaths(base, routeInfo.routePath));
@@ -229,4 +325,120 @@ async function extractExpressEndpoints(filePath) {
   return endpoints;
 }
 
-module.exports = { extractExpressEndpoints };
+// --- cross-file mounts: app.use('/api/users', usersRouter) where usersRouter lives in another file ---
+
+function requireSource(node) {
+  if (node && node.type === 'CallExpression' && node.callee.type === 'Identifier' &&
+    node.callee.name === 'require') {
+    return getStringLiteral(node.arguments[0]) || null;
+  }
+  return null;
+}
+
+// Local identifiers bound to relative imports/requires: name -> resolved file
+function collectRelativeImports(ast, filePath) {
+  const baseDir = path.dirname(filePath);
+  const map = new Map();
+  const bind = (name, source) => {
+    if (!name || !source || !source.startsWith('.')) return;
+    const resolved = resolveImportFile(baseDir, source);
+    if (resolved) map.set(name, resolved);
+  };
+
+  traverse(ast, {
+    ImportDeclaration(p) {
+      for (const spec of p.node.specifiers || []) bind(spec.local.name, p.node.source.value);
+    },
+    VariableDeclarator(p) {
+      const { id, init } = p.node;
+      // require('./x') or require('./x').default / .router
+      const source = requireSource(init) || (init && init.type === 'MemberExpression' ? requireSource(init.object) : null);
+      if (!source) return;
+      if (id.type === 'Identifier') bind(id.name, source);
+      if (id.type === 'ObjectPattern') {
+        for (const prop of id.properties) {
+          if (prop.type === 'ObjectProperty' && prop.value.type === 'Identifier') bind(prop.value.name, source);
+        }
+      }
+    }
+  });
+  return map;
+}
+
+// Returns [{ ownerName, prefix, childFile }] for every `x.use('/prefix', ..., importedRouter)` in a file
+async function collectExpressMounts(filePath) {
+  const ast = await parseFile(filePath);
+  const imports = collectRelativeImports(ast, filePath);
+  const routerBases = collectRouterBases(ast);
+  const mounts = [];
+
+  traverse(ast, {
+    CallExpression(p) {
+      const node = p.node;
+      if (node.callee.type !== 'MemberExpression') return;
+      const prop = node.callee.property;
+      if (!prop || prop.type !== 'Identifier' || prop.name !== 'use') return;
+      const ownerName = getMemberObjectName(node.callee);
+      const args = node.arguments || [];
+      const prefix = getStringLiteral(args[0]);
+      if (!prefix || !prefix.startsWith('/') || /[*(]/.test(prefix)) return;
+
+      for (const arg of args.slice(1)) {
+        let childFile = null;
+        if (arg.type === 'Identifier') childFile = imports.get(arg.name) || null;
+        const source = requireSource(arg);
+        if (source && source.startsWith('.')) childFile = resolveImportFile(path.dirname(filePath), source);
+        if (!childFile) continue;
+        const ownerBase = (ownerName && routerBases.get(ownerName)) || '';
+        mounts.push({ ownerName, prefix: joinPaths(ownerBase, prefix), childFile });
+      }
+    }
+  });
+  return mounts;
+}
+
+// Map of file -> Set of path prefixes it is mounted under (files never mounted are absent)
+async function computeExpressFilePrefixes(files) {
+  const edges = new Map(); // childFile -> [{ parentFile, prefix }]
+  for (const file of new Set(files)) {
+    let mounts = [];
+    try {
+      mounts = await collectExpressMounts(file);
+    } catch {
+      continue;
+    }
+    for (const mount of mounts) {
+      if (mount.childFile === file) continue;
+      if (!edges.has(mount.childFile)) edges.set(mount.childFile, []);
+      edges.get(mount.childFile).push({ parentFile: file, prefix: mount.prefix });
+    }
+  }
+
+  const memo = new Map();
+  function prefixesOf(file, visiting = new Set()) {
+    if (memo.has(file)) return memo.get(file);
+    if (visiting.has(file)) return new Set(['']);
+    visiting.add(file);
+    const parents = edges.get(file);
+    const out = new Set();
+    if (!parents) {
+      out.add('');
+    } else {
+      for (const { parentFile, prefix } of parents) {
+        for (const parentPrefix of prefixesOf(parentFile, visiting)) out.add(joinPaths(parentPrefix, prefix));
+      }
+    }
+    visiting.delete(file);
+    memo.set(file, out);
+    return out;
+  }
+
+  const result = new Map();
+  for (const file of edges.keys()) {
+    const prefixes = new Set([...prefixesOf(file)].map((p) => (p === '/' ? '' : p)));
+    result.set(file, prefixes);
+  }
+  return result;
+}
+
+module.exports = { extractExpressEndpoints, computeExpressFilePrefixes };

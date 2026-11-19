@@ -2,7 +2,7 @@ const fs = require('fs-extra');
 const path = require('path');
 const inquirer = require('inquirer');
 const fg = require('fast-glob');
-const { DEFAULT_CONFIG, resolveConfigPath } = require('./config');
+const { DEFAULT_CONFIG, resolveConfigPath, isEsmScope } = require('./config');
 const { info, warn, success } = require('./log');
 
 const APP_ROOTS = ['src', 'apps/**/src', 'services/**/src', 'libs/**/src'];
@@ -379,10 +379,18 @@ async function initConfig({ baseDir } = {}) {
     }
   };
 
-  const contents = `module.exports = ${JSON.stringify(config, null, 2)};\n`;
+  const contents = await serializeConfig(config, targetPath);
   await fs.outputFile(targetPath, contents);
   info(`Saved config to ${targetPath}`);
   success('Done');
+}
+
+async function serializeConfig(config, targetPath) {
+  const json = JSON.stringify(config, null, 2);
+  const ext = path.extname(targetPath).toLowerCase();
+  if (ext === '.json') return `${json}\n`;
+  const useEsm = ext === '.mjs' || (ext === '.js' && await isEsmScope(path.dirname(targetPath)));
+  return useEsm ? `export default ${json};\n` : `module.exports = ${json};\n`;
 }
 
 module.exports = { initConfig };

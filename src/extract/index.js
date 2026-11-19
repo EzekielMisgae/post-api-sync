@@ -1,6 +1,7 @@
 const { extractNestJsEndpoints } = require('./nestjs');
-const { extractExpressEndpoints } = require('./express');
-const { extractHonoEndpoints } = require('./hono');
+const { extractExpressEndpoints, computeExpressFilePrefixes } = require('./express');
+const { extractHonoEndpointsWithFiles } = require('./hono');
+const { joinPaths, normalizePath, toKey } = require('../utils');
 
 async function extractEndpoints(filePath, framework) {
   if (framework === 'nestjs') {
@@ -36,19 +37,61 @@ async function extractEndpoints(filePath, framework) {
   return Array.from(map.values());
 }
 
-async function extractAllEndpoints(files, framework) {
-  if (framework === 'hono') {
-    return extractHonoEndpoints(files);
+// Applies prefixes from `app.use('/prefix', router)` calls made in other files.
+function applyFilePrefixes(endpoints, filePrefixes) {
+  const out = [];
+  for (const endpoint of endpoints) {
+    const prefixes = filePrefixes.get(endpoint.filePath);
+    if (!prefixes || !prefixes.size || endpoint.protocol) {
+      out.push(endpoint);
+      continue;
+    }
+    for (const prefix of prefixes) {
+      if (!prefix) {
+        out.push(endpoint);
+        continue;
+      }
+      const fullPath = normalizePath(joinPaths(prefix, endpoint.path));
+      const generatedDescription = endpoint.description === `${endpoint.method} ${endpoint.path}`;
+      out.push({
+        ...endpoint,
+        path: fullPath,
+        description: generatedDescription ? `${endpoint.method} ${fullPath}` : endpoint.description,
+        key: toKey(endpoint.method, fullPath)
+      });
+    }
   }
+  return out;
+}
 
-  if (framework === 'auto') {
-    const hono = await extractHonoEndpoints(files);
-    if (hono.length) return hono;
+// `contextFiles` are other source files (e.g. src/app.ts, src/index.ts) that are only read
+// to find where routers are mounted; their own endpoints are not reported.
+async function extractAllEndpoints(files, framework, { contextFiles = [] } = {}) {
+  if (framework === 'hono') {
+    const hono = await extractHonoEndpointsWithFiles(files, contextFiles);
+    return hono.endpoints;
   }
 
   const endpoints = [];
-  for (const file of files) {
-    const extracted = await extractEndpoints(file, framework);
+  let remaining = files;
+
+  if (framework === 'auto') {
+    // Hono files are handled together so cross-file .route() mounts resolve;
+    // every other file still goes through the NestJS/Express extractors.
+    const hono = await extractHonoEndpointsWithFiles(files, contextFiles);
+    endpoints.push(...hono.endpoints);
+    remaining = files.filter((file) => !hono.honoFiles.has(file));
+  }
+
+  const extracted = [];
+  for (const file of remaining) {
+    extracted.push(...await extractEndpoints(file, framework));
+  }
+
+  if (framework !== 'nestjs' && remaining.length) {
+    const filePrefixes = await computeExpressFilePrefixes([...remaining, ...contextFiles]);
+    endpoints.push(...applyFilePrefixes(extracted, filePrefixes));
+  } else {
     endpoints.push(...extracted);
   }
   return endpoints;

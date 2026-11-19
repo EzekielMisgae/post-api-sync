@@ -4,6 +4,7 @@ const fs = require('fs-extra');
 const { parseFile } = require('./ast');
 const { normalizePath, joinPaths, toKey, HTTP_METHODS } = require('../utils');
 const { resolveZodSchema } = require('./zod');
+const { resolveImportFile } = require('./resolve');
 
 const ROUTER_CLASS_NAMES = new Set(['Hono', 'OpenAPIHono']);
 const HONO_METHODS = new Set([...HTTP_METHODS, 'all']);
@@ -22,39 +23,6 @@ function getPropertyName(node) {
   if (!node) return null;
   if (node.type === 'Identifier') return node.name;
   if (node.type === 'StringLiteral') return node.value;
-  return null;
-}
-
-function resolveImportFile(baseDir, source) {
-  const tryFiles = [];
-
-  if (path.isAbsolute(source)) {
-    tryFiles.push(source);
-  } else {
-    tryFiles.push(path.resolve(baseDir, source));
-  }
-
-  const ext = path.extname(source);
-  if (ext === '.js') {
-    tryFiles.push(path.resolve(baseDir, source.replace(/\.js$/, '.ts')));
-    tryFiles.push(path.resolve(baseDir, source.replace(/\.js$/, '.tsx')));
-  }
-  if (ext === '.jsx') {
-    tryFiles.push(path.resolve(baseDir, source.replace(/\.jsx$/, '.tsx')));
-  }
-
-  if (!ext) {
-    tryFiles.push(path.resolve(baseDir, `${source}.ts`));
-    tryFiles.push(path.resolve(baseDir, `${source}.tsx`));
-    tryFiles.push(path.resolve(baseDir, `${source}.js`));
-    tryFiles.push(path.resolve(baseDir, `${source}.jsx`));
-    tryFiles.push(path.resolve(baseDir, source, 'index.ts'));
-    tryFiles.push(path.resolve(baseDir, source, 'index.js'));
-  }
-
-  for (const candidate of tryFiles) {
-    if (fs.existsSync(candidate)) return candidate;
-  }
   return null;
 }
 
@@ -206,6 +174,19 @@ function parseCallChain(node) {
   return { root: current, calls };
 }
 
+function isHonoModule(source) {
+  return source === 'hono' || source.startsWith('hono/') || source.startsWith('@hono/');
+}
+
+function isHonoTypeAnnotation(param) {
+  const target = param && param.type === 'AssignmentPattern' ? param.left : param;
+  const typeNode = target && target.typeAnnotation && target.typeAnnotation.typeAnnotation;
+  return !!typeNode &&
+    typeNode.type === 'TSTypeReference' &&
+    typeNode.typeName.type === 'Identifier' &&
+    ROUTER_CLASS_NAMES.has(typeNode.typeName.name);
+}
+
 function isHonoNewExpression(node) {
   if (!node || node.type !== 'NewExpression') return false;
   if (node.callee.type !== 'Identifier') return false;
@@ -314,6 +295,87 @@ function generateExampleValue(schema) {
   return '';
 }
 
+function queryParamsFromSchema(schema) {
+  const out = [];
+  for (const [key, val] of Object.entries((schema && schema.properties) || {})) {
+    out.push({ name: key, key, required: !val.optional, type: val.type || 'string', example: val.example });
+  }
+  return out;
+}
+
+// Handles a single call made on a router, e.g. the `.get('/x', h)` in `app.get('/x', h)`
+// or any link of a chain like `app.get(...).post(...).route(...)`.
+function handleRouterCall(ctx, routerVar, name, args) {
+  const { endpoints, mounts, routers, routeDefs, schemaDefs } = ctx;
+
+  if (name === 'basePath') {
+    if (routers.has(routerVar)) recordBasePath(routers, routerVar, getStringLiteral(args[0]));
+    return;
+  }
+
+  if (name === 'route') {
+    const prefix = getStringLiteral(args[0]);
+    const child = args[1];
+    if (prefix && child && child.type === 'Identifier') {
+      mounts.push({ parentVar: routerVar, childIdent: child.name, prefix });
+    }
+    return;
+  }
+
+  if (HONO_METHODS.has(name)) {
+    const method = name === 'all' ? 'ALL' : name.toUpperCase();
+    const routePath = getStringLiteral(args[0]);
+    if (!routePath) return;
+    const params = {};
+    const middleware = [];
+    for (const arg of args.slice(1)) {
+      if (arg.type === 'CallExpression' && arg.callee.type === 'Identifier' && arg.callee.name === 'zValidator') {
+        const res = parseValidatorArgs(arg.arguments, schemaDefs);
+        if (res) {
+          if (res.target === 'json' || res.target === 'form') params.body = res.schema;
+          if (res.target === 'query') params.query = queryParamsFromSchema(res.schema);
+        }
+      }
+      const middlewareName = middlewareNameFromNode(arg);
+      if (middlewareName && middlewareName !== 'zValidator') middleware.push(middlewareName);
+    }
+    endpoints.push({ routerVar, method, path: routePath, description: `${method} ${routePath}`, middleware, parameters: params });
+    return;
+  }
+
+  if (name === 'on') {
+    const routePath = getStringLiteral(args[1]);
+    if (!routePath) return;
+    for (const method of parseMethodsFromOn({ type: 'CallExpression', arguments: args })) {
+      endpoints.push({ routerVar, method, path: routePath, description: `${method} ${routePath}` });
+    }
+    return;
+  }
+
+  if (name === 'openapi') {
+    const route = parseOpenApiRouteArg(args[0], routeDefs, schemaDefs);
+    if (route) {
+      endpoints.push({
+        routerVar,
+        method: route.method,
+        path: route.path,
+        summary: route.summary,
+        description: route.description || route.summary || `${route.method} ${route.path}`,
+        tags: route.tags || [],
+        middleware: route.middleware || [],
+        parameters: route.request ? extractParameters(route.request) : {}
+      });
+    }
+  }
+}
+
+// True when this call is a link inside a longer chain (`a.get()` in `a.get().post()`)
+function isInnerChainCall(path) {
+  const parent = path.parentPath;
+  return !!parent && parent.isMemberExpression({ object: path.node }) &&
+    !!parent.parentPath && parent.parentPath.isCallExpression({ callee: parent.node });
+}
+
 async function parseHonoFile(filePath) {
   const ast = await parseFile(filePath);
   const routers = new Map();
@@ -323,11 +385,14 @@ async function parseHonoFile(filePath) {
   const imports = new Map();
   const routeDefs = new Map();
   const schemaDefs = new Map(); // Store Zod schemas defined in variables
+  let importsHono = false;
+  const ctx = { endpoints, mounts, routers, routeDefs, schemaDefs };
 
   traverse(ast, {
     ImportDeclaration(p) {
       const node = p.node;
       const source = node.source.value;
+      if (source && isHonoModule(source)) importsHono = true;
       if (!source || !source.startsWith('.')) return;
       const baseDir = path.dirname(filePath);
       const resolved = resolveImportFile(baseDir, source);
@@ -365,6 +430,16 @@ async function parseHonoFile(filePath) {
       }
     },
 
+    Function(path) {
+      // e.g. export function registerUsers(app: Hono) { app.get(...) }
+      for (const param of path.node.params || []) {
+        const target = param.type === 'AssignmentPattern' ? param.left : param;
+        if (target.type === 'Identifier' && isHonoTypeAnnotation(param)) {
+          routers.set(target.name, { basePath: '' });
+        }
+      }
+    },
+
     VariableDeclarator(path) {
       const node = path.node;
       if (node.id.type !== 'Identifier') return;
@@ -389,80 +464,20 @@ async function parseHonoFile(filePath) {
 
       if (init.type === 'CallExpression') {
         const { root, calls } = parseCallChain(init);
-        if (isHonoNewExpression(root)) {
+        const isDerivedRouter = root && root.type === 'Identifier' && routers.has(root.name) &&
+          calls.length > 0 && calls[0].name === 'basePath';
+        if (isDerivedRouter) {
+          // basePath() returns a new router that inherits the parent's prefix
           routers.set(varName, { basePath: '' });
-          for (const call of calls) {
-            if (call.name === 'basePath') {
-              const bp = getStringLiteral(call.args[0]);
-              recordBasePath(routers, varName, bp);
-            }
-            if (HONO_METHODS.has(call.name)) {
-              const method = call.name === 'all' ? 'ALL' : call.name.toUpperCase();
-              const routePath = getStringLiteral(call.args[0]);
-              if (routePath) {
-                const params = {};
-                const middleware = [];
-                for (const arg of call.args.slice(1)) {
-                  if (arg.type === 'CallExpression' && arg.callee.name === 'zValidator') {
-                    const res = parseValidatorArgs(arg.arguments, schemaDefs);
-                    if (res) {
-                      if (res.target === 'json' || res.target === 'form') params.body = res.schema;
-                      if (res.target === 'query') {
-                        const queryParams = [];
-                        if (res.schema.properties) {
-                          for (const [key, val] of Object.entries(res.schema.properties)) {
-                            queryParams.push({
-                              name: key,
-                              key,
-                              required: !val.optional,
-                              type: val.type || 'string',
-                              example: val.example
-                            });
-                          }
-                        }
-                        params.query = queryParams;
-                      }
-                    }
-                  }
-                  const middlewareName = middlewareNameFromNode(arg);
-                  if (middlewareName && middlewareName !== 'zValidator') {
-                    middleware.push(middlewareName);
-                  }
-                }
-
-                endpoints.push({
-                  routerVar: varName,
-                  method,
-                  path: routePath,
-                  description: `${method} ${routePath}`,
-                  middleware,
-                  parameters: params
-                });
-              }
-            }
-            if (call.name === 'on') {
-              const methods = parseMethodsFromOn({ arguments: call.args });
-              const routePath = getStringLiteral(call.args[1]);
-              for (const method of methods) {
-                endpoints.push({ routerVar: varName, method, path: routePath, description: `${method} ${routePath}` });
-              }
-            }
-            if (call.name === 'openapi') {
-              const route = parseOpenApiRouteArg(call.args[0], routeDefs, schemaDefs);
-              if (route) {
-                endpoints.push({
-                  routerVar: varName,
-                  method: route.method,
-                  path: route.path,
-                  summary: route.summary,
-                  description: route.description || route.summary || `${route.method} ${route.path}`,
-                  tags: route.tags || [],
-                  middleware: route.middleware || [],
-                  parameters: route.request ? extractParameters(route.request) : {}
-                });
-              }
-            }
-          }
+          recordBasePath(routers, varName, getStringLiteral(calls[0].args[0]));
+          mounts.push({ parentVar: root.name, childIdent: varName, prefix: '' });
+          for (const call of calls.slice(1)) handleRouterCall(ctx, varName, call.name, call.args);
+          return;
+        }
+        if (isHonoNewExpression(root)) {
+          // const app = new Hono().basePath('/api').get(...).route('/x', x)
+          routers.set(varName, { basePath: '' });
+          for (const call of calls) handleRouterCall(ctx, varName, call.name, call.args);
         }
       }
     },
@@ -470,108 +485,31 @@ async function parseHonoFile(filePath) {
     CallExpression(path) {
       const node = path.node;
       if (node.callee.type !== 'MemberExpression') return;
-      const prop = node.callee.property;
-      if (prop.type !== 'Identifier') return;
-      const methodName = prop.name;
+      if (isInnerChainCall(path)) return; // the outermost call handles the whole chain
 
-      if (node.callee.object.type === 'Identifier') {
-        const routerVar = node.callee.object.name;
+      const { root, calls } = parseCallChain(node);
+      if (!root || root.type !== 'Identifier' || !calls.length) return;
 
-        if (methodName === 'basePath') {
-          if (!routers.has(routerVar)) routers.set(routerVar, { basePath: '' });
-          const bp = getStringLiteral(node.arguments[0]);
-          if (bp) recordBasePath(routers, routerVar, bp);
-          return;
-        }
+      // `const x = app.basePath(...)...` is a derived router, handled in VariableDeclarator
+      if (calls[0].name === 'basePath' && path.parent.type === 'VariableDeclarator') return;
 
-        if (methodName === 'route') {
-          if (!routers.has(routerVar)) routers.set(routerVar, { basePath: '' });
-          const prefix = getStringLiteral(node.arguments[0]);
-          const child = node.arguments[1];
-          if (prefix && child && child.type === 'Identifier') {
-            mounts.push({ parentVar: routerVar, childIdent: child.name, prefix });
-          }
-          return;
-        }
-
-        if (HONO_METHODS.has(methodName)) {
-          if (!routers.has(routerVar)) routers.set(routerVar, { basePath: '' });
-          const method = methodName === 'all' ? 'ALL' : methodName.toUpperCase();
-          const routePath = getStringLiteral(node.arguments[0]);
-          if (routePath) {
-            const params = {};
-            const middleware = [];
-            for (const arg of node.arguments.slice(1)) {
-              if (arg.type === 'CallExpression' && arg.callee.name === 'zValidator') {
-                const res = parseValidatorArgs(arg.arguments, schemaDefs);
-                if (res) {
-                  if (res.target === 'json' || res.target === 'form') params.body = res.schema;
-                  if (res.target === 'query') {
-                    const queryParams = [];
-                    if (res.schema.properties) {
-                      for (const [key, val] of Object.entries(res.schema.properties)) {
-                        queryParams.push({
-                          name: key,
-                          key,
-                          required: !val.optional,
-                          type: val.type || 'string',
-                          example: val.example
-                        });
-                      }
-                    }
-                    params.query = queryParams;
-                  }
-                }
-              }
-              const middlewareName = middlewareNameFromNode(arg);
-              if (middlewareName && middlewareName !== 'zValidator') {
-                middleware.push(middlewareName);
-              }
-            }
-
-            endpoints.push({
-              routerVar,
-              method,
-              path: routePath,
-              description: `${method} ${routePath}`,
-              middleware,
-              parameters: params
-            });
-          }
-          return;
-        }
-
-        if (methodName === 'on') {
-          if (!routers.has(routerVar)) routers.set(routerVar, { basePath: '' });
-          const methods = parseMethodsFromOn(node);
-          const routePath = getStringLiteral(node.arguments[1]);
-          for (const method of methods) {
-            endpoints.push({ routerVar, method, path: routePath, description: `${method} ${routePath}` });
-          }
-          return;
-        }
-
-        if (methodName === 'openapi') {
-          if (!routers.has(routerVar)) routers.set(routerVar, { basePath: '' });
-          const route = parseOpenApiRouteArg(node.arguments[0], routeDefs, schemaDefs);
-          if (route) {
-            endpoints.push({
-              routerVar,
-              method: route.method,
-              path: route.path,
-              summary: route.summary,
-              description: route.description || route.summary || `${route.method} ${route.path}`,
-              tags: route.tags || [],
-              middleware: route.middleware || [],
-              parameters: route.request ? extractParameters(route.request) : {}
-            });
-          }
-        }
-      }
+      for (const call of calls) handleRouterCall(ctx, root.name, call.name, call.args);
     }
   });
 
-  return { filePath, routers, endpoints, mounts, exports, imports };
+  // Only keep calls made on known Hono routers (declared here or imported from another file).
+  // Anything else, e.g. `cache.get('key')` or `params.get('id')`, is not a route.
+  const isRouterCandidate = (name) => routers.has(name) || imports.has(name);
+
+  return {
+    filePath,
+    routers,
+    endpoints: endpoints.filter((e) => isRouterCandidate(e.routerVar)),
+    mounts: mounts.filter((m) => isRouterCandidate(m.parentVar)),
+    exports,
+    imports,
+    importsHono
+  };
 }
 
 function routerId(filePath, varName) {
@@ -622,9 +560,12 @@ function addPrefix(prefixesByRouter, routerIdValue, prefix) {
   return true;
 }
 
-async function extractHonoEndpoints(files) {
+// `contextFiles` (e.g. src/index.ts) are parsed only to learn how routers are mounted;
+// endpoints are only reported for `files`.
+async function extractHonoEndpointsWithFiles(files, contextFiles = []) {
+  const scanned = new Set(files);
   const fileDataMap = new Map();
-  for (const file of files) {
+  for (const file of new Set([...files, ...contextFiles])) {
     try {
       const data = await parseHonoFile(file);
       fileDataMap.set(file, data);
@@ -638,17 +579,24 @@ async function extractHonoEndpoints(files) {
   const edges = new Map();
   const childHasParent = new Set();
 
+  const honoFiles = new Set();
+
   for (const data of fileDataMap.values()) {
-    for (const endpoint of data.endpoints) {
-      const id = routerId(data.filePath, endpoint.routerVar);
+    const isScanned = scanned.has(data.filePath);
+    if (isScanned && (data.importsHono || data.routers.size > 0)) honoFiles.add(data.filePath);
+
+    for (const endpoint of isScanned ? data.endpoints : []) {
+      const id = resolveChildRouterId(endpoint.routerVar, data, fileDataMap);
+      if (!id || !routers.has(id)) continue;
       if (!endpointsByRouter.has(id)) endpointsByRouter.set(id, []);
       endpointsByRouter.get(id).push(endpoint);
+      honoFiles.add(data.filePath);
     }
 
     for (const mount of data.mounts) {
-      const parentId = routerId(data.filePath, mount.parentVar);
+      const parentId = resolveChildRouterId(mount.parentVar, data, fileDataMap);
       const childId = resolveChildRouterId(mount.childIdent, data, fileDataMap);
-      if (!childId) continue;
+      if (!parentId || !childId || !routers.has(parentId) || !routers.has(childId)) continue;
       if (!edges.has(parentId)) edges.set(parentId, []);
       edges.get(parentId).push({ childId, prefix: mount.prefix });
       childHasParent.add(childId);
@@ -705,7 +653,12 @@ async function extractHonoEndpoints(files) {
     }
   }
 
-  return results;
+  return { endpoints: results, honoFiles };
 }
 
-module.exports = { extractHonoEndpoints };
+async function extractHonoEndpoints(files, contextFiles = []) {
+  const { endpoints } = await extractHonoEndpointsWithFiles(files, contextFiles);
+  return endpoints;
+}
+
+module.exports = { extractHonoEndpoints, extractHonoEndpointsWithFiles };

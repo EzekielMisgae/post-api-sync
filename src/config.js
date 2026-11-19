@@ -1,4 +1,6 @@
 const path = require('path');
+const Module = require('module');
+const { pathToFileURL } = require('url');
 const fs = require('fs-extra');
 
 const ALWAYS_EXCLUDE = ['**/node_modules/**', '**/dist/**', '**/build/**', '**/*.d.ts'];
@@ -51,6 +53,21 @@ const DEFAULT_CONFIG = {
   }
 };
 
+const CONFIG_FILENAMES = [
+  'post-api-sync.config.js',
+  'post-api-sync.config.cjs',
+  'post-api-sync.config.mjs',
+  'post-api-sync.config.json'
+];
+
+async function findConfigInDir(dir) {
+  for (const name of CONFIG_FILENAMES) {
+    const candidate = path.resolve(dir, name);
+    if (await fs.pathExists(candidate)) return candidate;
+  }
+  return path.resolve(dir, CONFIG_FILENAMES[0]);
+}
+
 async function resolveConfigPath(configPath, baseDir) {
   let cwd = baseDir ? path.resolve(baseDir) : process.cwd();
 
@@ -60,28 +77,98 @@ async function resolveConfigPath(configPath, baseDir) {
       const stat = await fs.stat(abs);
       if (stat.isDirectory()) {
         cwd = abs;
-        return { path: path.resolve(cwd, 'post-api-sync.config.js'), baseDir: cwd };
+        return { path: await findConfigInDir(cwd), baseDir: cwd };
       }
       return { path: abs, baseDir: path.dirname(abs) };
     }
     if (!path.extname(abs)) {
       cwd = abs;
-      return { path: path.resolve(cwd, 'post-api-sync.config.js'), baseDir: cwd };
+      return { path: await findConfigInDir(cwd), baseDir: cwd };
     }
     return { path: abs, baseDir: cwd };
   }
 
-  return { path: path.resolve(cwd, 'post-api-sync.config.js'), baseDir: cwd };
+  return { path: await findConfigInDir(cwd), baseDir: cwd };
 }
 
 async function loadConfig(configPath, baseDir) {
   const resolved = await resolveConfigPath(configPath, baseDir);
   if (await fs.pathExists(resolved.path)) {
-    // eslint-disable-next-line global-require, import/no-dynamic-require
-    const userConfig = require(resolved.path);
+    const userConfig = await importConfigFile(resolved.path);
     return { config: mergeDeep(DEFAULT_CONFIG, userConfig), path: resolved.path, baseDir: resolved.baseDir };
   }
   return { config: DEFAULT_CONFIG, path: resolved.path, baseDir: resolved.baseDir };
+}
+
+async function importConfigFile(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext === '.json') return fs.readJson(filePath);
+  if (ext === '.mjs') return importEsm(filePath);
+  if (ext === '.cjs') return compileCommonJs(filePath);
+
+  // .js: its module type depends on the nearest package.json "type" field.
+  // Config files written by older versions of `init` always use `module.exports`,
+  // so fall back to CommonJS when an ESM-scoped file turns out to be CommonJS.
+  if (await isEsmScope(path.dirname(filePath))) {
+    try {
+      return await importEsm(filePath);
+    } catch (err) {
+      if (!isCommonJsInEsmError(err)) throw err;
+      return compileCommonJs(filePath);
+    }
+  }
+
+  try {
+    return compileCommonJs(filePath);
+  } catch (err) {
+    if (!(err instanceof SyntaxError)) throw err;
+    try {
+      return await importEsm(filePath);
+    } catch {
+      throw new Error(
+        `Could not load ${path.basename(filePath)}: it uses ESM syntax in a CommonJS package. ` +
+        'Rename it to post-api-sync.config.mjs, or use module.exports.'
+      );
+    }
+  }
+}
+
+async function importEsm(filePath) {
+  const mod = await import(`${pathToFileURL(filePath).href}?t=${Date.now()}`);
+  return mod.default !== undefined ? mod.default : mod;
+}
+
+// Evaluates a file as CommonJS regardless of the surrounding package's "type".
+function compileCommonJs(filePath) {
+  const code = fs.readFileSync(filePath, 'utf8');
+  const mod = new Module(filePath, module);
+  mod.filename = filePath;
+  mod.paths = Module._nodeModulePaths(path.dirname(filePath));
+  mod._compile(code, filePath);
+  const out = mod.exports;
+  return out && out.__esModule && out.default !== undefined ? out.default : out;
+}
+
+function isCommonJsInEsmError(err) {
+  return err instanceof ReferenceError && /\b(module|exports|require) is not defined\b/.test(err.message);
+}
+
+async function isEsmScope(dir) {
+  let current = dir;
+  while (true) {
+    const pkgPath = path.join(current, 'package.json');
+    if (await fs.pathExists(pkgPath)) {
+      try {
+        const pkg = await fs.readJson(pkgPath);
+        return pkg.type === 'module';
+      } catch {
+        return false;
+      }
+    }
+    const parent = path.dirname(current);
+    if (parent === current) return false;
+    current = parent;
+  }
 }
 
 function mergeDeep(base, override) {
@@ -154,6 +241,7 @@ module.exports = {
   DEFAULT_CONFIG,
   resolveConfigPath,
   loadConfig,
+  isEsmScope,
   ensureAbsolute,
   normalizeIncludePatterns,
   normalizeExcludePatterns,

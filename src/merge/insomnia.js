@@ -1,64 +1,70 @@
 const { buildInsomniaCollection } = require('../collection/insomnia');
-const { normalizePath } = require('../utils');
+const { normalizeMatchPath } = require('./postman-additive');
 
+// Keeps the existing workspace, environments and requests as they are and adds requests
+// for new endpoints. With merge.updateExisting, existing requests also get the method, URL
+// and headers from code (their bodies are still kept).
 function mergeInsomniaCollection(endpoints, config, existing) {
   const generated = buildInsomniaCollection(endpoints, config);
-  if (!existing || !existing.resources) return generated;
+  if (!existing || !Array.isArray(existing.resources)) return generated;
+
+  const updateExisting = !!(config.merge && config.merge.updateExisting);
+  const resources = existing.resources.map((r) => ({ ...r }));
+  const workspace = resources.find((r) => r._type === 'workspace');
+  if (!workspace) return generated;
+
+  const existingByKey = new Map();
+  for (const req of resources) {
+    if (req._type !== 'request') continue;
+    const key = keyFromRequest(req);
+    if (key && !existingByKey.has(key)) existingByKey.set(key, req);
+  }
 
   const generatedRequests = generated.resources.filter((r) => r._type === 'request');
-  const existingRequests = existing.resources.filter((r) => r._type === 'request');
-
-  const existingMap = new Map();
-  for (const req of existingRequests) {
-    const key = keyFromRequest(req);
-    if (key) existingMap.set(key, req);
-  }
-
-  const mergedRequests = [];
+  const generatedKeys = new Set();
   for (const req of generatedRequests) {
     const key = keyFromRequest(req);
-    if (key && existingMap.has(key)) {
-      mergedRequests.push(mergeRequest(req, existingMap.get(key)));
-    } else {
-      mergedRequests.push(req);
+    generatedKeys.add(key);
+    const match = existingByKey.get(key);
+    if (!match) {
+      // New requests go into the existing workspace, not the freshly generated one
+      resources.push({ ...req, parentId: workspace._id });
+      existingByKey.set(key, req);
+    } else if (updateExisting) {
+      Object.assign(match, {
+        method: req.method || match.method,
+        url: req.url || match.url,
+        headers: mergeHeaders(req.headers || [], match.headers || [])
+      });
     }
   }
 
-  if (config.merge && config.merge.markDeprecated) {
-    for (const [key, req] of existingMap.entries()) {
-      if (!generatedRequests.find((r) => keyFromRequest(r) === key)) {
-        const deprecated = { ...req };
-        deprecated.name = deprecated.name.startsWith('[DEPRECATED]')
-          ? deprecated.name
-          : `[DEPRECATED] ${deprecated.name}`;
-        mergedRequests.push(deprecated);
-      }
+  if (updateExisting && config.merge && config.merge.markDeprecated) {
+    for (const [key, req] of existingByKey.entries()) {
+      if (generatedKeys.has(key)) continue;
+      const name = String(req.name || '');
+      if (!name.startsWith('[DEPRECATED]')) req.name = `[DEPRECATED] ${name}`;
     }
   }
 
-  const nonRequestResources = generated.resources.filter((r) => r._type !== 'request');
+  // Make sure there is a baseUrl environment value without overwriting user values
+  const env = resources.find((r) => r._type === 'environment' && r.parentId === workspace._id);
+  const generatedEnv = generated.resources.find((r) => r._type === 'environment');
+  if (env && generatedEnv) {
+    env.data = { ...(generatedEnv.data || {}), ...(env.data || {}) };
+  } else if (!env && generatedEnv) {
+    resources.push({ ...generatedEnv, parentId: workspace._id });
+  }
 
-  return {
-    ...existing,
-    resources: [...nonRequestResources, ...mergedRequests]
-  };
+  return { ...existing, resources };
 }
 
 function keyFromRequest(req) {
   if (!req || !req.method || !req.url) return null;
-  const url = req.url.replace(/\{\{\s*_.baseUrl\s*\}\}/i, '');
-  return `${req.method.toUpperCase()} ${normalizePath(url)}`;
-}
-
-function mergeRequest(newReq, existingReq) {
-  return {
-    ...existingReq,
-    name: newReq.name || existingReq.name,
-    method: newReq.method || existingReq.method,
-    url: newReq.url || existingReq.url,
-    headers: mergeHeaders(newReq.headers || [], existingReq.headers || []),
-    body: newReq.body || existingReq.body
-  };
+  const url = String(req.url)
+    .replace(/^\{\{\s*_\.[A-Za-z0-9_]+\s*\}\}/, '')
+    .replace(/^[a-z][a-z0-9+.-]*:\/\/[^/?#]*/i, '');
+  return `${req.method.toUpperCase()} ${normalizeMatchPath(url)}`;
 }
 
 function mergeHeaders(codeHeaders, existingHeaders) {
@@ -69,7 +75,7 @@ function mergeHeaders(codeHeaders, existingHeaders) {
   }
   for (const h of codeHeaders) {
     if (!h || !h.name) continue;
-    map.set(h.name.toLowerCase(), h);
+    if (!map.has(h.name.toLowerCase())) map.set(h.name.toLowerCase(), h);
   }
   return Array.from(map.values());
 }
