@@ -11,7 +11,7 @@ const postmanCloud = require('./sync/postman-cloud');
 const { info, warn, success, error } = require('./log');
 const { isJsOrTs } = require('./utils');
 
-function reportAdditive(label, result, dryRun) {
+function reportAdditive(label, result, dryRun, verbose = false) {
   const verb = dryRun ? 'would add' : 'adding';
   if (!result.added.length) {
     info(`${label}: no new endpoints.`);
@@ -24,12 +24,13 @@ function reportAdditive(label, result, dryRun) {
   }
   if (result.stale.length) {
     warn(`${label}: ${result.stale.length} request(s) don't match any endpoint in code (left as is):`);
-    for (const name of result.stale.slice(0, 20)) warn(`  ? ${name}`);
-    if (result.stale.length > 20) warn(`  ... and ${result.stale.length - 20} more`);
+    const shown = verbose ? result.stale : result.stale.slice(0, 20);
+    for (const s of shown) warn(`  ? ${s.name}  (${s.method} ${s.url})`);
+    if (shown.length < result.stale.length) warn(`  ... and ${result.stale.length - shown.length} more (use --verbose to list all)`);
   }
 }
 
-async function syncOnce({ configPath, baseDir, postmanKey, postmanId, dryRun = false } = {}) {
+async function syncOnce({ configPath, baseDir, postmanKey, postmanId, dryRun = false, verbose = false } = {}) {
   try {
     const { config, baseDir: resolvedBase } = await loadConfig(configPath, baseDir);
     const cwd = resolvedBase || process.cwd();
@@ -90,7 +91,11 @@ async function syncOnce({ configPath, baseDir, postmanKey, postmanId, dryRun = f
     const unique = new Map();
     for (const e of extracted) unique.set(`${appOf(e.filePath)}|${e.key}`, e);
 
-    const finalEndpoints = Array.from(unique.values());
+    let finalEndpoints = Array.from(unique.values());
+    if (config.sources && config.sources.includeRpc === false) {
+      // gRPC methods and @MessagePattern/@EventPattern handlers can't be called from Postman
+      finalEndpoints = finalEndpoints.filter((e) => !e.protocol);
+    }
     info(`Found ${finalEndpoints.length} endpoint(s)`);
 
     if (extractionFailed) {
@@ -117,7 +122,7 @@ async function syncOnce({ configPath, baseDir, postmanKey, postmanId, dryRun = f
       } else {
         const generated = buildPostmanCollection(finalEndpoints, config);
         const result = addNewEndpoints(existing, generated, config);
-        reportAdditive(`Local collection (${relOut})`, result, dryRun);
+        reportAdditive(`Local collection (${relOut})`, result, dryRun, verbose);
         if (!dryRun && (!existing || result.added.length || result.addedVariables.length)) {
           await fs.outputJson(outPath, result.collection, { spaces: 2 });
           success(`Postman collection written to ${relOut}`);
@@ -130,7 +135,7 @@ async function syncOnce({ configPath, baseDir, postmanKey, postmanId, dryRun = f
           const remote = await postmanCloud.fetchCollection(pmKey, pmId);
           const generated = buildPostmanCollection(finalEndpoints, config);
           const result = addNewEndpoints(remote, generated, config);
-          reportAdditive(`Postman collection "${(remote.info && remote.info.name) || pmId}"`, result, dryRun);
+          reportAdditive(`Postman collection "${(remote.info && remote.info.name) || pmId}"`, result, dryRun, verbose);
 
           if (dryRun) {
             info('[dry run] Postman was not modified.');

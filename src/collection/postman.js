@@ -90,10 +90,7 @@ function buildPostmanCollection(endpoints, config) {
 
   const variables = [
     { key: 'baseUrl', value: baseUrl, type: 'string' },
-    { key: 'authToken', value: '', type: 'string' },
-    { key: 'userId', value: '', type: 'string' },
-    { key: 'orderId', value: '', type: 'string' },
-    { key: 'wholesaleCustomerId', value: '', type: 'string' }
+    { key: 'authToken', value: '', type: 'string' }
   ];
 
   for (const [appName, appUrl] of appBaseUrls) {
@@ -613,7 +610,7 @@ function buildQueryParams(queryParams) {
 
 function preferInferredQueryExample(key, example) {
   const normalizedKey = String(key || '').replace(/[^A-Za-z0-9]/g, '').toLowerCase();
-  if (['userid', 'orderid', 'wholesalecustomerid', 'limit', 'offset', 'status'].includes(normalizedKey)) {
+  if (['limit', 'offset', 'status'].includes(normalizedKey)) {
     return true;
   }
   if (example === '' || example === null || example === undefined) return true;
@@ -710,9 +707,6 @@ function inferPrimitiveExample(name, type, context) {
   const normalizedType = normalizeType(type);
 
   const variableMap = {
-    userid: '{{userId}}',
-    orderid: '{{orderId}}',
-    wholesalecustomerid: '{{wholesaleCustomerId}}',
     authtoken: '{{authToken}}'
   };
 

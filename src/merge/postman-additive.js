@@ -34,8 +34,16 @@ function basePathPrefixes(config) {
   return Array.from(prefixes);
 }
 
+// Hand-made requests often have real IDs pasted in place of :id
+function looksLikeId(segment) {
+  return /^\d+$/.test(segment) || // 42
+    /^[0-9a-f]{24}$/i.test(segment) || // Mongo ObjectId
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(segment) || // UUID
+    (segment.length >= 16 && /\d/.test(segment) && /[a-z]/i.test(segment) && /^[A-Za-z0-9_-]+$/.test(segment)); // cuid/nanoid
+}
+
 function isParamSegment(segment) {
-  return /^:/.test(segment) || /^\{\{.+\}\}$/.test(segment) || /^\{.+\}$/.test(segment);
+  return /^:/.test(segment) || /^\{\{.+\}\}$/.test(segment) || /^\{.+\}$/.test(segment) || looksLikeId(segment);
 }
 
 // '/users/:id', '/users/{id}' and '/users/{{userId}}' all become '/users/:'
@@ -169,7 +177,12 @@ function addNewEndpoints(existingCollection, generatedCollection, config) {
   // Requests in the collection that no longer match any endpoint in code (reported, not touched)
   const stale = existingRequests
     .filter((item) => ![...requestMatchKeys(item, prefixes)].some((key) => generatedKeys.has(key)))
-    .map((item) => item.name);
+    .map((item) => {
+      const request = item.request || {};
+      const url = typeof request === 'string' ? request : request.url;
+      const raw = typeof url === 'string' ? url : (url && url.raw) || pathFromPostmanUrl(url);
+      return { name: item.name, method: (typeof request === 'string' ? 'GET' : request.method) || 'GET', url: raw };
+    });
 
   return { collection, added, addedVariables, stale };
 }

@@ -30,13 +30,15 @@ program
   .option('--postman-key <key>', 'Postman API Key')
   .option('--postman-id <id>', 'Postman Collection UID')
   .option('--dry-run', 'Show which endpoints would be added without writing anything')
+  .option('--verbose', 'List every request that does not match an endpoint in code')
   .action(async (opts) => {
     await syncOnce({
       configPath: opts.config,
       baseDir: opts.cwd,
       postmanKey: opts.postmanKey,
       postmanId: opts.postmanId,
-      dryRun: !!opts.dryRun
+      dryRun: !!opts.dryRun,
+      verbose: !!opts.verbose
     });
   });
 

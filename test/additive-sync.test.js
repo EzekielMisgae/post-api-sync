@@ -78,7 +78,7 @@ test('additive: only new endpoints are added; existing requests are byte-for-byt
   assert.equal(collection.variable.find((v) => v.key === 'authToken').value, 'secret');
   assert.equal(collection.variable.find((v) => v.key === 'baseUrl').value, 'https://staging.example.com/api');
 
-  assert.deepEqual(stale, ['Old thing']);
+  assert.deepEqual(stale.map((s) => s.name), ['Old thing']);
 });
 
 test('additive: running twice adds nothing the second time', () => {
@@ -190,4 +190,45 @@ test('sync: a bad API key is reported and the collection is not modified', async
     delete process.env.POSTMAN_API_BASE_URL;
     server.close();
   }
+});
+
+test('additive: hand-made requests with real IDs pasted in still match', () => {
+  const existing = {
+    info: { name: 'x' },
+    item: [
+      { name: 'get age demographic data', request: { method: 'GET', url: '{{admin}}/analytics/6650f1a2b3c4d5e6f7a8b9c0/demographic/age' } },
+      { name: 'get agent', request: { method: 'GET', url: 'http://localhost:8000/api/agent/3fa85f64-5717-4562-b3fc-2c963f66afa6' } },
+      { name: 'get order', request: { method: 'GET', url: '{{baseUrl}}/orders/42' } }
+    ]
+  };
+  const endpoints = [
+    { method: 'GET', path: '/analytics/:id/demographic/age', key: 'GET /analytics/:id/demographic/age', tags: ['A'] },
+    { method: 'GET', path: '/agent/:agentId', key: 'GET /agent/:agentId', tags: ['A'] },
+    { method: 'GET', path: '/agent/self', key: 'GET /agent/self', tags: ['A'] },
+    { method: 'GET', path: '/orders/:id', key: 'GET /orders/:id', tags: ['A'] }
+  ];
+  const { added, stale } = addNewEndpoints(existing, buildPostmanCollection(endpoints, CONFIG), CONFIG);
+  assert.deepEqual(added.map((a) => a.name), ['Get Self - GET /agent/self']);
+  assert.deepEqual(stale, []);
+});
+
+test('sync: sources.includeRpc=false leaves out gRPC and event handlers', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'post-api-sync-rpc-'));
+  await fs.outputFile(path.join(dir, 'src/users/users.controller.ts'), `
+    import { Controller, Get } from '@nestjs/common';
+    import { GrpcMethod, EventPattern } from '@nestjs/microservices';
+    @Controller('users')
+    export class UsersController {
+      @Get() list() {}
+      @GrpcMethod('UserService', 'FindOne') findOne() {}
+      @EventPattern('user.created') onCreated() {}
+    }`);
+  await fs.outputJson(path.join(dir, 'post-api-sync.config.json'), {
+    framework: 'nestjs',
+    sources: { include: ['src/**/*.controller.ts'], includeRpc: false },
+    output: { postman: { enabled: true, outputPath: './out.json' }, insomnia: { enabled: false } }
+  });
+  await syncOnce({ configPath: dir });
+  const written = await fs.readJson(path.join(dir, 'out.json'));
+  assert.deepEqual(flatten(written.item).map((i) => `${i.request.method} ${i.request.url.raw}`), ['GET {{baseUrl}}/users']);
 });
