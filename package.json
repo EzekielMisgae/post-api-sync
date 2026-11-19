@@ -13,7 +13,8 @@
   "scripts": {
     "sync": "node bin/post-api-sync.js sync",
     "watch": "node bin/post-api-sync.js watch",
-    "init": "node bin/post-api-sync.js init"
+    "init": "node bin/post-api-sync.js init",
+    "test": "node --test test/*.test.js"
   },
   "dependencies": {
     "@babel/parser": "^7.24.0",

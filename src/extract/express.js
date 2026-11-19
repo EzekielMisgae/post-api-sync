@@ -73,6 +73,94 @@ function collectMiddlewareNames(args) {
   return Array.from(new Set(middleware));
 }
 
+// Fallback for routers whose creation we can't see (e.g. passed in from another file)
+const ROUTER_NAME_PATTERN = /(app|server|api|router|routes)$/i;
+const ROUTER_TYPE_NAMES = new Set(['Router', 'Express', 'Application', 'IRouter']);
+
+function isRequireExpress(node) {
+  return !!node &&
+    node.type === 'CallExpression' &&
+    node.callee.type === 'Identifier' &&
+    node.callee.name === 'require' &&
+    getStringLiteral(node.arguments[0]) === 'express';
+}
+
+// express(), Router(), express.Router(), require('express')(), require('express').Router()
+function isRouterFactoryCall(node, expressNames, routerFactoryNames) {
+  if (!node || node.type !== 'CallExpression') return false;
+  const { callee } = node;
+  if (callee.type === 'Identifier') {
+    return expressNames.has(callee.name) || routerFactoryNames.has(callee.name);
+  }
+  if (isRequireExpress(callee)) return true;
+  if (callee.type === 'MemberExpression' && callee.property.type === 'Identifier' && callee.property.name === 'Router') {
+    return isRequireExpress(callee.object) ||
+      (callee.object.type === 'Identifier' && expressNames.has(callee.object.name));
+  }
+  return false;
+}
+
+function hasRouterTypeAnnotation(param) {
+  const typeNode = param && param.typeAnnotation && param.typeAnnotation.typeAnnotation;
+  if (!typeNode || typeNode.type !== 'TSTypeReference') return false;
+  const { typeName } = typeNode;
+  if (typeName.type === 'Identifier') return ROUTER_TYPE_NAMES.has(typeName.name);
+  if (typeName.type === 'TSQualifiedName') return ROUTER_TYPE_NAMES.has(typeName.right.name);
+  return false;
+}
+
+function collectRouterNames(ast) {
+  const expressNames = new Set(['express']);
+  const routerFactoryNames = new Set(['Router']);
+  const routers = new Set();
+
+  traverse(ast, {
+    ImportDeclaration(path) {
+      if (path.node.source.value !== 'express') return;
+      for (const spec of path.node.specifiers || []) {
+        if (spec.type === 'ImportDefaultSpecifier' || spec.type === 'ImportNamespaceSpecifier') {
+          expressNames.add(spec.local.name);
+        }
+        if (spec.type === 'ImportSpecifier' && spec.imported.name === 'Router') {
+          routerFactoryNames.add(spec.local.name);
+        }
+      }
+    },
+    VariableDeclarator(path) {
+      const { id, init } = path.node;
+      if (isRequireExpress(init)) {
+        if (id.type === 'Identifier') expressNames.add(id.name);
+        if (id.type === 'ObjectPattern') {
+          for (const prop of id.properties) {
+            if (prop.type === 'ObjectProperty' && prop.key.name === 'Router' && prop.value.type === 'Identifier') {
+              routerFactoryNames.add(prop.value.name);
+            }
+          }
+        }
+        return;
+      }
+      if (id.type === 'Identifier' && isRouterFactoryCall(init, expressNames, routerFactoryNames)) {
+        routers.add(id.name);
+      }
+    },
+    Function(path) {
+      for (const param of path.node.params || []) {
+        if (param.type === 'Identifier' && hasRouterTypeAnnotation(param)) routers.add(param.name);
+      }
+    }
+  });
+
+  return routers;
+}
+
+function isRouterName(name, knownRouters) {
+  return !!name && (knownRouters.has(name) || ROUTER_NAME_PATTERN.test(name));
+}
+
+function looksLikeRoutePath(routePath) {
+  return routePath.startsWith('/') || routePath === '*';
+}
+
 function collectRouterBases(ast) {
   const baseMap = new Map();
 
@@ -107,6 +195,8 @@ async function extractExpressEndpoints(filePath) {
   const ast = await parseFile(filePath);
   const endpoints = [];
   const routerBases = collectRouterBases(ast);
+  const knownRouters = collectRouterNames(ast);
+  for (const name of routerBases.keys()) knownRouters.add(name);
   const schemaDefs = new Map();
 
   // First pass: collect potential schemas
@@ -175,10 +265,13 @@ async function extractExpressEndpoints(filePath) {
         const args = node.arguments || [];
         if (!args.length) return;
         const routePath = getStringLiteral(args[0]);
-        if (!routePath) return;
+        if (!routePath || !looksLikeRoutePath(routePath)) return;
+
+        const ownerName = getMemberObjectName(node.callee);
+        // Skip look-alikes such as cache.get('key') or params.delete('id')
+        if (!isRouterName(ownerName, knownRouters)) return;
 
         let base = '';
-        const ownerName = getMemberObjectName(node.callee);
         if (ownerName && routerBases.has(ownerName)) {
           base = routerBases.get(ownerName);
         }
@@ -206,6 +299,7 @@ async function extractExpressEndpoints(filePath) {
         const owner = node.callee.object;
         const routeInfo = getRouteCallInfoFromChain(owner);
         if (!routeInfo) return;
+        if (!looksLikeRoutePath(routeInfo.routePath) || !isRouterName(routeInfo.routerName, knownRouters)) return;
         const method = property.name.toUpperCase();
         const base = routerBases.get(routeInfo.routerName) || '';
         const fullPath = normalizePath(joinPaths(base, routeInfo.routePath));

@@ -4,12 +4,32 @@ const path = require('path');
 const { loadConfig, ensureAbsolute, normalizeIncludePatterns, normalizeExcludePatterns, ALWAYS_EXCLUDE, DEFAULT_INCLUDE } = require('./config');
 const { extractAllEndpoints } = require('./extract');
 const { mergePostmanCollection } = require('./merge/postman');
+const { addNewEndpoints } = require('./merge/postman-additive');
+const { buildPostmanCollection } = require('./collection/postman');
 const { mergeInsomniaCollection } = require('./merge/insomnia');
 const postmanCloud = require('./sync/postman-cloud');
 const { info, warn, success, error } = require('./log');
 const { isJsOrTs } = require('./utils');
 
-async function syncOnce({ configPath, baseDir, postmanKey, postmanId } = {}) {
+function reportAdditive(label, result, dryRun) {
+  const verb = dryRun ? 'would add' : 'adding';
+  if (!result.added.length) {
+    info(`${label}: no new endpoints.`);
+  } else {
+    info(`${label}: ${verb} ${result.added.length} new request(s):`);
+    for (const a of result.added) info(`  + ${a.name}${a.folder ? `  [${a.folder}]` : ''}`);
+  }
+  if (result.addedVariables.length) {
+    info(`${label}: ${verb} missing variable(s): ${result.addedVariables.join(', ')}`);
+  }
+  if (result.stale.length) {
+    warn(`${label}: ${result.stale.length} request(s) don't match any endpoint in code (left as is):`);
+    for (const name of result.stale.slice(0, 20)) warn(`  ? ${name}`);
+    if (result.stale.length > 20) warn(`  ... and ${result.stale.length - 20} more`);
+  }
+}
+
+async function syncOnce({ configPath, baseDir, postmanKey, postmanId, dryRun = false } = {}) {
   try {
     const { config, baseDir: resolvedBase } = await loadConfig(configPath, baseDir);
     const cwd = resolvedBase || process.cwd();
@@ -50,6 +70,7 @@ async function syncOnce({ configPath, baseDir, postmanKey, postmanId } = {}) {
     }
 
     let extracted = [];
+    let extractionFailed = false;
     try {
       extracted = await extractAllEndpoints(jsTsFiles, config.framework);
       if (extracted.length === 0 && config.framework && config.framework !== 'auto') {
@@ -61,6 +82,7 @@ async function syncOnce({ configPath, baseDir, postmanKey, postmanId } = {}) {
       }
     } catch (err) {
       warn(`Extraction failed: ${err.message || err}`);
+      extractionFailed = true;
     }
 
     const unique = new Map();
@@ -69,21 +91,56 @@ async function syncOnce({ configPath, baseDir, postmanKey, postmanId } = {}) {
     const finalEndpoints = Array.from(unique.values());
     info(`Found ${finalEndpoints.length} endpoint(s)`);
 
+    if (extractionFailed) {
+      error('Endpoint extraction failed, so collections were left untouched.');
+      process.exitCode = 1;
+      return;
+    }
+
+    const updateExisting = !!(config.merge && config.merge.updateExisting);
+
     if (config.output && config.output.postman && config.output.postman.enabled) {
       const outPath = ensureAbsolute(config.output.postman.outputPath, cwd);
       const existing = await readJsonIfExists(outPath);
-      const merged = mergePostmanCollection(finalEndpoints, config, existing);
-      await fs.outputJson(outPath, merged, { spaces: 2 });
-      success(`Postman collection written to ${path.relative(process.cwd(), outPath)}`);
+      const relOut = path.relative(process.cwd(), outPath);
 
-      // Auto-sync checks
+      if (updateExisting) {
+        const merged = mergePostmanCollection(finalEndpoints, config, existing);
+        if (dryRun) {
+          info(`[dry run] Would rewrite ${relOut} (merge.updateExisting is on)`);
+        } else {
+          await fs.outputJson(outPath, merged, { spaces: 2 });
+          success(`Postman collection written to ${relOut}`);
+        }
+      } else {
+        const generated = buildPostmanCollection(finalEndpoints, config);
+        const result = addNewEndpoints(existing, generated, config);
+        reportAdditive(`Local collection (${relOut})`, result, dryRun);
+        if (!dryRun && (!existing || result.added.length || result.addedVariables.length)) {
+          await fs.outputJson(outPath, result.collection, { spaces: 2 });
+          success(`Postman collection written to ${relOut}`);
+        }
+      }
+
       if (pmKey && pmId) {
-        info(`Pushing to Postman Cloud (ID: ${pmId})...`);
         try {
-          await postmanCloud.pushToPostman(merged, pmKey, pmId);
-          success('Successfully synced to Postman Cloud!');
+          info(`Fetching Postman collection ${pmId}...`);
+          const remote = await postmanCloud.fetchCollection(pmKey, pmId);
+          const generated = buildPostmanCollection(finalEndpoints, config);
+          const result = addNewEndpoints(remote, generated, config);
+          reportAdditive(`Postman collection "${(remote.info && remote.info.name) || pmId}"`, result, dryRun);
+
+          if (dryRun) {
+            info('[dry run] Postman was not modified.');
+          } else if (result.added.length || result.addedVariables.length) {
+            await postmanCloud.updateCollection(pmKey, pmId, result.collection);
+            success(`Added ${result.added.length} request(s) to Postman. Existing requests were not changed.`);
+          } else {
+            success('Postman collection is already up to date; nothing was sent.');
+          }
         } catch (err) {
-          error(`Failed to sync to Postman Cloud: ${err.message}`);
+          error(`Failed to sync to Postman: ${err.message}`);
+          process.exitCode = 1;
         }
       } else if (pmKey || pmId) {
         // Partial keys present
@@ -93,7 +150,9 @@ async function syncOnce({ configPath, baseDir, postmanKey, postmanId } = {}) {
       }
     }
 
-    if (config.output && config.output.insomnia && config.output.insomnia.enabled) {
+    if (dryRun && config.output && config.output.insomnia && config.output.insomnia.enabled) {
+      info('[dry run] Skipping Insomnia output.');
+    } else if (config.output && config.output.insomnia && config.output.insomnia.enabled) {
       const outPath = ensureAbsolute(config.output.insomnia.outputPath, cwd);
       const existing = await readJsonIfExists(outPath);
       const merged = mergeInsomniaCollection(finalEndpoints, config, existing);

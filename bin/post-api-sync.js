@@ -29,12 +29,14 @@ program
   .option('--cwd <path>', 'Project root (used for config + globs)')
   .option('--postman-key <key>', 'Postman API Key')
   .option('--postman-id <id>', 'Postman Collection UID')
+  .option('--dry-run', 'Show which endpoints would be added without writing anything')
   .action(async (opts) => {
     await syncOnce({
       configPath: opts.config,
       baseDir: opts.cwd,
       postmanKey: opts.postmanKey,
-      postmanId: opts.postmanId
+      postmanId: opts.postmanId,
+      dryRun: !!opts.dryRun
     });
   });
 

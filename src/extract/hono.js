@@ -7,6 +7,7 @@ const { resolveZodSchema } = require('./zod');
 
 const ROUTER_CLASS_NAMES = new Set(['Hono', 'OpenAPIHono']);
 const HONO_METHODS = new Set([...HTTP_METHODS, 'all']);
+const SOURCE_EXTENSIONS = new Set(['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs']);
 const ALLOWED_ON_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD']);
 
 function getStringLiteral(node) {
@@ -43,7 +44,8 @@ function resolveImportFile(baseDir, source) {
     tryFiles.push(path.resolve(baseDir, source.replace(/\.jsx$/, '.tsx')));
   }
 
-  if (!ext) {
+  // './posts.routes' has extname '.routes', which is not a real file extension
+  if (!SOURCE_EXTENSIONS.has(ext)) {
     tryFiles.push(path.resolve(baseDir, `${source}.ts`));
     tryFiles.push(path.resolve(baseDir, `${source}.tsx`));
     tryFiles.push(path.resolve(baseDir, `${source}.js`));
@@ -53,7 +55,7 @@ function resolveImportFile(baseDir, source) {
   }
 
   for (const candidate of tryFiles) {
-    if (fs.existsSync(candidate)) return candidate;
+    if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate;
   }
   return null;
 }
@@ -206,6 +208,19 @@ function parseCallChain(node) {
   return { root: current, calls };
 }
 
+function isHonoModule(source) {
+  return source === 'hono' || source.startsWith('hono/') || source.startsWith('@hono/');
+}
+
+function isHonoTypeAnnotation(param) {
+  const target = param && param.type === 'AssignmentPattern' ? param.left : param;
+  const typeNode = target && target.typeAnnotation && target.typeAnnotation.typeAnnotation;
+  return !!typeNode &&
+    typeNode.type === 'TSTypeReference' &&
+    typeNode.typeName.type === 'Identifier' &&
+    ROUTER_CLASS_NAMES.has(typeNode.typeName.name);
+}
+
 function isHonoNewExpression(node) {
   if (!node || node.type !== 'NewExpression') return false;
   if (node.callee.type !== 'Identifier') return false;
@@ -323,11 +338,13 @@ async function parseHonoFile(filePath) {
   const imports = new Map();
   const routeDefs = new Map();
   const schemaDefs = new Map(); // Store Zod schemas defined in variables
+  let importsHono = false;
 
   traverse(ast, {
     ImportDeclaration(p) {
       const node = p.node;
       const source = node.source.value;
+      if (source && isHonoModule(source)) importsHono = true;
       if (!source || !source.startsWith('.')) return;
       const baseDir = path.dirname(filePath);
       const resolved = resolveImportFile(baseDir, source);
@@ -365,6 +382,16 @@ async function parseHonoFile(filePath) {
       }
     },
 
+    Function(path) {
+      // e.g. export function registerUsers(app: Hono) { app.get(...) }
+      for (const param of path.node.params || []) {
+        const target = param.type === 'AssignmentPattern' ? param.left : param;
+        if (target.type === 'Identifier' && isHonoTypeAnnotation(param)) {
+          routers.set(target.name, { basePath: '' });
+        }
+      }
+    },
+
     VariableDeclarator(path) {
       const node = path.node;
       if (node.id.type !== 'Identifier') return;
@@ -389,6 +416,15 @@ async function parseHonoFile(filePath) {
 
       if (init.type === 'CallExpression') {
         const { root, calls } = parseCallChain(init);
+        const isDerivedRouter = root && root.type === 'Identifier' && routers.has(root.name) &&
+          calls.length > 0 && calls[0].name === 'basePath';
+        if (isDerivedRouter) {
+          // basePath() returns a new router that inherits the parent's prefix
+          routers.set(varName, { basePath: '' });
+          recordBasePath(routers, varName, getStringLiteral(calls[0].args[0]));
+          mounts.push({ parentVar: root.name, childIdent: varName, prefix: '' });
+          return;
+        }
         if (isHonoNewExpression(root)) {
           routers.set(varName, { basePath: '' });
           for (const call of calls) {
@@ -478,14 +514,15 @@ async function parseHonoFile(filePath) {
         const routerVar = node.callee.object.name;
 
         if (methodName === 'basePath') {
-          if (!routers.has(routerVar)) routers.set(routerVar, { basePath: '' });
+          // `const x = app.basePath(...)` is a derived router, handled in VariableDeclarator
+          if (path.parent.type === 'VariableDeclarator') return;
+          if (!routers.has(routerVar)) return;
           const bp = getStringLiteral(node.arguments[0]);
           if (bp) recordBasePath(routers, routerVar, bp);
           return;
         }
 
         if (methodName === 'route') {
-          if (!routers.has(routerVar)) routers.set(routerVar, { basePath: '' });
           const prefix = getStringLiteral(node.arguments[0]);
           const child = node.arguments[1];
           if (prefix && child && child.type === 'Identifier') {
@@ -495,7 +532,6 @@ async function parseHonoFile(filePath) {
         }
 
         if (HONO_METHODS.has(methodName)) {
-          if (!routers.has(routerVar)) routers.set(routerVar, { basePath: '' });
           const method = methodName === 'all' ? 'ALL' : methodName.toUpperCase();
           const routePath = getStringLiteral(node.arguments[0]);
           if (routePath) {
@@ -542,7 +578,6 @@ async function parseHonoFile(filePath) {
         }
 
         if (methodName === 'on') {
-          if (!routers.has(routerVar)) routers.set(routerVar, { basePath: '' });
           const methods = parseMethodsFromOn(node);
           const routePath = getStringLiteral(node.arguments[1]);
           for (const method of methods) {
@@ -552,7 +587,6 @@ async function parseHonoFile(filePath) {
         }
 
         if (methodName === 'openapi') {
-          if (!routers.has(routerVar)) routers.set(routerVar, { basePath: '' });
           const route = parseOpenApiRouteArg(node.arguments[0], routeDefs, schemaDefs);
           if (route) {
             endpoints.push({
@@ -571,7 +605,19 @@ async function parseHonoFile(filePath) {
     }
   });
 
-  return { filePath, routers, endpoints, mounts, exports, imports };
+  // Only keep calls made on known Hono routers (declared here or imported from another file).
+  // Anything else, e.g. `cache.get('key')` or `params.get('id')`, is not a route.
+  const isRouterCandidate = (name) => routers.has(name) || imports.has(name);
+
+  return {
+    filePath,
+    routers,
+    endpoints: endpoints.filter((e) => isRouterCandidate(e.routerVar)),
+    mounts: mounts.filter((m) => isRouterCandidate(m.parentVar)),
+    exports,
+    imports,
+    importsHono
+  };
 }
 
 function routerId(filePath, varName) {
@@ -622,7 +668,7 @@ function addPrefix(prefixesByRouter, routerIdValue, prefix) {
   return true;
 }
 
-async function extractHonoEndpoints(files) {
+async function extractHonoEndpointsWithFiles(files) {
   const fileDataMap = new Map();
   for (const file of files) {
     try {
@@ -638,17 +684,23 @@ async function extractHonoEndpoints(files) {
   const edges = new Map();
   const childHasParent = new Set();
 
+  const honoFiles = new Set();
+
   for (const data of fileDataMap.values()) {
+    if (data.importsHono || data.routers.size > 0) honoFiles.add(data.filePath);
+
     for (const endpoint of data.endpoints) {
-      const id = routerId(data.filePath, endpoint.routerVar);
+      const id = resolveChildRouterId(endpoint.routerVar, data, fileDataMap);
+      if (!id || !routers.has(id)) continue;
       if (!endpointsByRouter.has(id)) endpointsByRouter.set(id, []);
       endpointsByRouter.get(id).push(endpoint);
+      honoFiles.add(data.filePath);
     }
 
     for (const mount of data.mounts) {
-      const parentId = routerId(data.filePath, mount.parentVar);
+      const parentId = resolveChildRouterId(mount.parentVar, data, fileDataMap);
       const childId = resolveChildRouterId(mount.childIdent, data, fileDataMap);
-      if (!childId) continue;
+      if (!parentId || !childId || !routers.has(parentId) || !routers.has(childId)) continue;
       if (!edges.has(parentId)) edges.set(parentId, []);
       edges.get(parentId).push({ childId, prefix: mount.prefix });
       childHasParent.add(childId);
@@ -705,7 +757,12 @@ async function extractHonoEndpoints(files) {
     }
   }
 
-  return results;
+  return { endpoints: results, honoFiles };
 }
 
-module.exports = { extractHonoEndpoints };
+async function extractHonoEndpoints(files) {
+  const { endpoints } = await extractHonoEndpointsWithFiles(files);
+  return endpoints;
+}
+
+module.exports = { extractHonoEndpoints, extractHonoEndpointsWithFiles };

@@ -31,20 +31,13 @@ function extractPathParams(p) {
 }
 
 function toPostmanPath(p) {
-  // Convert :param and {param} to {{param}} for Postman variables
-  const normalized = normalizePath(p)
-    .replace(/:([A-Za-z0-9_]+)/g, '{{$1}}');
-
-  return normalized.replace(/{([A-Za-z0-9_]+)}/g, (match, name, offset, full) => {
-    const before = full[offset - 1];
-    const after = full[offset + match.length];
-    if (before === '{' || after === '}') return match;
-    return `{{${name}}}`;
-  });
+  // Convert {param} and legacy {{param}} to :param, which Postman treats as a path variable
+  return normalizePath(p)
+    .replace(/{{\s*([A-Za-z0-9_]+)\s*}}/g, ':$1')
+    .replace(/{([A-Za-z0-9_]+)}/g, ':$1');
 }
 
 function splitPath(p) {
-  // Keep {{param}} intact when splitting
   return normalizePath(p).split('/').filter(Boolean);
 }
 

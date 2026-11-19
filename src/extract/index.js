@@ -1,6 +1,6 @@
 const { extractNestJsEndpoints } = require('./nestjs');
 const { extractExpressEndpoints } = require('./express');
-const { extractHonoEndpoints } = require('./hono');
+const { extractHonoEndpoints, extractHonoEndpointsWithFiles } = require('./hono');
 
 async function extractEndpoints(filePath, framework) {
   if (framework === 'nestjs') {
@@ -41,13 +41,18 @@ async function extractAllEndpoints(files, framework) {
     return extractHonoEndpoints(files);
   }
 
+  const endpoints = [];
+  let remaining = files;
+
   if (framework === 'auto') {
-    const hono = await extractHonoEndpoints(files);
-    if (hono.length) return hono;
+    // Hono files are handled together so cross-file .route() mounts resolve;
+    // every other file still goes through the NestJS/Express extractors.
+    const hono = await extractHonoEndpointsWithFiles(files);
+    endpoints.push(...hono.endpoints);
+    remaining = files.filter((file) => !hono.honoFiles.has(file));
   }
 
-  const endpoints = [];
-  for (const file of files) {
+  for (const file of remaining) {
     const extracted = await extractEndpoints(file, framework);
     endpoints.push(...extracted);
   }

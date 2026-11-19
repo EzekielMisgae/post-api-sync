@@ -98,21 +98,31 @@ POSTMAN_COLLECTION_ID=your-collection-uid
 
 ## Postman Cloud Sync
 
-You can push your generated collection directly to Postman without manual importing.
+Sync adds new endpoints to your existing Postman collection and leaves everything already in it alone. Requests you've edited keep their bodies, headers, scripts, examples, names and folders. Collection variables keep their values; only missing ones get added.
 
-1.  Get your **Postman API Key** from your [Account Settings](https://postman.co/settings/me/api-keys).
-2.  Get your **Collection UID** (Right-click collection -> Info).
-3.  Run the sync command:
+1.  Create a **Postman API Key** in [Settings → API keys](https://postman.co/settings/me/api-keys). The free plan works.
+2.  Copy your **Collection ID**: open the collection in Postman → **Info** panel (the `i` icon on the right).
+3.  Put both in a `.env` file in the project root:
 
 ```bash
-# Finds keys in .env or config
-npx post-api-sync
-
-# Or specify manually
-npx post-api-sync sync --postman-key <YOUR_KEY> --postman-id <COLLECTION_UID>
+POSTMAN_API_KEY=PMAK-xxxxxxxx
+POSTMAN_COLLECTION_ID=12345678-aaaa-bbbb-cccc-1234567890ab
 ```
 
-Or set them in your config/environment variables to use with `watch` mode.
+4.  Preview first, then sync:
+
+```bash
+npx post-api-sync sync --dry-run   # lists what would be added; changes nothing
+npx post-api-sync sync             # adds the new requests to Postman
+```
+
+How it works:
+- It fetches the collection, finds endpoints in your code that aren't in it yet, and puts each one in a matching folder (the folder is created if it's missing).
+- A request counts as already present if its method and path match. Matching ignores the host (`{{baseUrl}}`, `{{anything}}` or `http://localhost:3000`), ignores the base URL's path prefix such as `/api`, and ignores how path params are written (`:id`, `{id}` or `{{userId}}`).
+- If nothing is new, nothing is sent. Otherwise it makes one GET and one PUT. Free Postman plans have a monthly API call limit, so be careful with `watch` mode.
+- Requests that no longer match anything in code are listed as warnings and are never renamed or deleted.
+
+The local file at `output.postman.outputPath` is updated the same way. To go back to the old behaviour, where existing requests are overwritten from code, set `merge: { updateExisting: true }`. That only affects the local file.
 
 ## Supported Patterns
 
