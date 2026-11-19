@@ -72,9 +72,10 @@ async function syncOnce({ configPath, baseDir, postmanKey, postmanId, dryRun = f
     let extracted = [];
     let extractionFailed = false;
     try {
-      extracted = await extractAllEndpoints(jsTsFiles, config.framework);
+      const contextFiles = await findMountContextFiles(cwd, exclude, jsTsFiles);
+      extracted = await extractAllEndpoints(jsTsFiles, config.framework, { contextFiles });
       if (extracted.length === 0 && config.framework && config.framework !== 'auto') {
-        const fallback = await extractAllEndpoints(jsTsFiles, 'auto');
+        const fallback = await extractAllEndpoints(jsTsFiles, 'auto', { contextFiles });
         if (fallback.length) {
           warn(`No endpoints found for framework=${config.framework}. Falling back to auto-detect.`);
           extracted = fallback;
@@ -85,8 +86,9 @@ async function syncOnce({ configPath, baseDir, postmanKey, postmanId, dryRun = f
       extractionFailed = true;
     }
 
+    // Same method+path in two different apps (apps/auth, apps/orders) are different endpoints
     const unique = new Map();
-    for (const e of extracted) unique.set(e.key, e);
+    for (const e of extracted) unique.set(`${appOf(e.filePath)}|${e.key}`, e);
 
     const finalEndpoints = Array.from(unique.values());
     info(`Found ${finalEndpoints.length} endpoint(s)`);
@@ -165,6 +167,31 @@ async function syncOnce({ configPath, baseDir, postmanKey, postmanId, dryRun = f
   }
 }
 
+// Files outside the include globs that mount routers (app.use('/api', router), app.route('/x', x)),
+// typically src/app.ts or src/index.ts. They're read only to get route prefixes right.
+async function findMountContextFiles(cwd, exclude, scannedFiles) {
+  const scanned = new Set(scannedFiles);
+  const candidates = await fg(['**/*.{ts,js,mts,cts,mjs,cjs}'], {
+    cwd,
+    absolute: true,
+    dot: false,
+    ignore: [...exclude, '**/*.d.ts', '**/*.{spec,test}.{ts,js}', '**/coverage/**', '**/.next/**']
+  });
+  const out = [];
+  for (const file of candidates) {
+    if (scanned.has(file)) continue;
+    try {
+      const stat = await fs.stat(file);
+      if (stat.size > 512 * 1024) continue;
+      const text = await fs.readFile(file, 'utf8');
+      if (/\.(use|route)\s*\(/.test(text)) out.push(file);
+    } catch {
+      // unreadable file; ignore
+    }
+  }
+  return out;
+}
+
 async function autoDiscoverEndpointFiles(cwd, exclude) {
   const discovered = await fg(['**/*.{ts,js,tsx,jsx}'], {
     cwd,
@@ -190,6 +217,11 @@ async function autoDiscoverEndpointFiles(cwd, exclude) {
 
   // Keep deterministic order and remove duplicates
   return Array.from(new Set(candidates)).sort();
+}
+
+function appOf(filePath) {
+  const match = String(filePath || '').replace(/\\/g, '/').match(/\/(?:apps|services)\/([^/]+)\//i);
+  return match ? match[1].toLowerCase() : '';
 }
 
 async function readJsonIfExists(filePath) {
