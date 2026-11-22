@@ -4,7 +4,7 @@ const { syncOnce } = require('./sync');
 const { info } = require('./log');
 
 async function watchMode({ configPath, baseDir, postmanKey, postmanId } = {}) {
-  const { config, baseDir: resolvedBase } = await loadConfig(configPath, baseDir);
+  const { config, baseDir: resolvedBase, path: resolvedConfigPath } = await loadConfig(configPath, baseDir);
   const cwd = resolvedBase || process.cwd();
   const include = normalizeIncludePatterns(config.sources.include || [], cwd);
   const exclude = Array.from(new Set([
@@ -19,7 +19,8 @@ async function watchMode({ configPath, baseDir, postmanKey, postmanId } = {}) {
   const trigger = () => {
     if (timer) clearTimeout(timer);
     timer = setTimeout(() => {
-      syncOnce({ configPath, baseDir: cwd, postmanKey, postmanId });
+      // Use the already-resolved config path; a relative -c would otherwise be resolved twice
+      syncOnce({ configPath: resolvedConfigPath, baseDir: cwd, postmanKey, postmanId });
     }, debounceMs);
   };
 

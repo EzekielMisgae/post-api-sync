@@ -28,9 +28,8 @@ function mergePostmanCollection(endpoints, config, existing) {
     for (const [key, item] of existingMap.entries()) {
       if (!newItems.find((i) => keyFromPostmanItem(i) === key)) {
         const deprecated = { ...item };
-        deprecated.name = deprecated.name.startsWith('[DEPRECATED]')
-          ? deprecated.name
-          : `[DEPRECATED] ${deprecated.name}`;
+        const name = String(deprecated.name || '');
+        deprecated.name = name.startsWith('[DEPRECATED]') ? name : `[DEPRECATED] ${name}`;
         mergedItems.push(deprecated);
       }
     }
